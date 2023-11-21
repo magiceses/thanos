@@ -70,7 +70,22 @@ func (rr *GRPCClient) Rules(ctx context.Context, req *rulespb.RulesRequest) (*ru
 		}
 	}
 
-	resp.groups = filterRules(resp.groups, matcherSets)
+	queryFormToSet := func(values []string) map[string]struct{} {
+		set := make(map[string]struct{}, len(values))
+		for _, v := range values {
+			set[v] = struct{}{}
+		}
+		return set
+	}
+
+	resp.groups = filterRules(
+		resp.groups,
+		matcherSets,
+		queryFormToSet(req.RuleGroup),
+		queryFormToSet(req.RuleName),
+		queryFormToSet(req.File),
+	)
+
 	// TODO(bwplotka): Move to SortInterface with equal method and heap.
 	resp.groups = dedupGroups(resp.groups)
 	for _, g := range resp.groups {
@@ -81,15 +96,36 @@ func (rr *GRPCClient) Rules(ctx context.Context, req *rulespb.RulesRequest) (*ru
 }
 
 // filterRules filters rules in a group according to given matcherSets.
-func filterRules(ruleGroups []*rulespb.RuleGroup, matcherSets [][]*labels.Matcher) []*rulespb.RuleGroup {
+func filterRules(ruleGroups []*rulespb.RuleGroup, matcherSets [][]*labels.Matcher, rgSet, rnSet, fSet map[string]struct{}) []*rulespb.RuleGroup {
 	if len(matcherSets) == 0 {
 		return ruleGroups
 	}
 
 	groupCount := 0
 	for _, g := range ruleGroups {
+		if len(rgSet) > 0 {
+			if _, ok := rgSet[g.Name]; !ok {
+				groupCount++
+				continue
+			}
+		}
+
+		if len(fSet) > 0 {
+			if _, ok := fSet[g.File]; !ok {
+				groupCount++
+				continue
+			}
+		}
+
 		ruleCount := 0
 		for _, r := range g.Rules {
+			if len(rnSet) > 0 {
+				if _, ok := rnSet[r.GetName()]; !ok {
+					ruleCount++
+					continue
+				}
+			}
+
 			// Filter rules based on matcher.
 			rl := r.GetLabels()
 			if matches(matcherSets, rl) {

@@ -72,6 +72,9 @@ const (
 	MaxSourceResolutionParam = "max_source_resolution"
 	ReplicaLabelsParam       = "replicaLabels[]"
 	MatcherParam             = "match[]"
+	RuleGroupParam           = "rule_group[]"
+	RuleNameParam            = "rule_name[]"
+	FileParam                = "file[]"
 	StoreMatcherParam        = "storeMatch[]"
 	Step                     = "step"
 	Stats                    = "stats"
@@ -1151,6 +1154,9 @@ func NewRulesHandler(client rules.UnaryClient, enablePartialResponse bool) func(
 			Type:                    rulespb.RulesRequest_Type(typ),
 			PartialResponseStrategy: ps,
 			MatcherString:           r.Form[MatcherParam],
+			RuleGroup:               r.Form[RuleGroupParam],
+			RuleName:                r.Form[RuleNameParam],
+			File:                    r.Form[FileParam],
 		}
 		tracing.DoInSpan(ctx, "retrieve_rules", func(ctx context.Context) {
 			groups, warnings, err = client.Rules(ctx, req)
