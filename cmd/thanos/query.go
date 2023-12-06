@@ -48,6 +48,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/metadata"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/query"
+	"github.com/thanos-io/thanos/pkg/query/adapter"
 	"github.com/thanos-io/thanos/pkg/rules"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
@@ -764,6 +765,18 @@ func runQuery(
 		)
 
 		api.Register(router.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
+
+		// Experimental federate endpoint.
+		promAdapter := adapter.NewPrometheus(
+			logger,
+			queryableCreator,
+			enableAutodownsampling,
+			enableQueryPartialResponse,
+			enableQueryPushdown,
+			queryReplicaLabels,
+			instantDefaultMaxSourceResolution,
+		)
+		promAdapter.Register(router, tracer, ins)
 
 		srv := httpserver.New(logger, reg, comp, httpProbe,
 			httpserver.WithListen(httpBindAddr),
