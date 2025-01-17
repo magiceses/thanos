@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/thanos-io/thanos/pkg/compact"
 
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
@@ -49,16 +50,16 @@ func newDownsampleMetrics(reg *prometheus.Registry) *DownsampleMetrics {
 	m.downsamples = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "thanos_compact_downsample_total",
 		Help: "Total number of downsampling attempts.",
-	}, []string{"group"})
+	}, []string{"resolution"})
 	m.downsampleFailures = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "thanos_compact_downsample_failures_total",
 		Help: "Total number of failed downsampling attempts.",
-	}, []string{"group"})
+	}, []string{"resolution"})
 	m.downsampleDuration = promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "thanos_compact_downsample_duration_seconds",
 		Help:    "Duration of downsample runs",
 		Buckets: []float64{60, 300, 900, 1800, 3600, 7200, 14400}, // 1m, 5m, 15m, 30m, 60m, 120m, 240m
-	}, []string{"group"})
+	}, []string{"resolution"})
 
 	return m
 }
@@ -83,16 +84,17 @@ func RunDownsample(
 		return err
 	}
 
-	bkt, err := client.NewBucket(logger, confContentYaml, component.Downsample.String())
+	bkt, err := client.NewBucket(logger, confContentYaml, component.Downsample.String(), nil)
 	if err != nil {
 		return err
 	}
 	insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 	// While fetching blocks, filter out blocks that were marked for no downsample.
-	metaFetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, "", extprom.WrapRegistererWithPrefix("thanos_", reg), []block.MetadataFilter{
+	baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+	metaFetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix("thanos_", reg), []block.MetadataFilter{
 		block.NewDeduplicateFilter(block.FetcherConcurrency),
-		downsample.NewGatherNoDownsampleMarkFilter(logger, insBkt),
+		downsample.NewGatherNoDownsampleMarkFilter(logger, insBkt, block.FetcherConcurrency),
 	})
 	if err != nil {
 		return errors.Wrap(err, "create meta fetcher")
@@ -128,9 +130,9 @@ func RunDownsample(
 				}
 
 				for _, meta := range metas {
-					groupKey := meta.Thanos.GroupKey()
-					metrics.downsamples.WithLabelValues(groupKey)
-					metrics.downsampleFailures.WithLabelValues(groupKey)
+					resolutionLabel := meta.Thanos.ResolutionString()
+					metrics.downsamples.WithLabelValues(resolutionLabel)
+					metrics.downsampleFailures.WithLabelValues(resolutionLabel)
 				}
 				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
 					return errors.Wrap(err, "downsampling failed")
@@ -261,11 +263,11 @@ func downsampleBucket(
 					errMsg = "downsampling to 60 min"
 				}
 				if err := processDownsampling(workerCtx, logger, bkt, m, dir, resolution, hashFunc, metrics, acceptMalformedIndex, blockFilesConcurrency); err != nil {
-					metrics.downsampleFailures.WithLabelValues(m.Thanos.GroupKey()).Inc()
+					metrics.downsampleFailures.WithLabelValues(m.Thanos.ResolutionString()).Inc()
 					errCh <- errors.Wrap(err, errMsg)
 
 				}
-				metrics.downsamples.WithLabelValues(m.Thanos.GroupKey()).Inc()
+				metrics.downsamples.WithLabelValues(m.Thanos.ResolutionString()).Inc()
 			}
 		}()
 	}
@@ -357,11 +359,11 @@ func processDownsampling(
 
 	err := block.Download(ctx, logger, bkt, m.ULID, bdir, objstore.WithFetchConcurrency(blockFilesConcurrency))
 	if err != nil {
-		return errors.Wrapf(err, "download block %s", m.ULID)
+		return compact.NewRetryError(errors.Wrapf(err, "download block %s", m.ULID))
 	}
 	level.Info(logger).Log("msg", "downloaded block", "id", m.ULID, "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds())
 
-	if err := block.VerifyIndex(logger, filepath.Join(bdir, block.IndexFilename), m.MinTime, m.MaxTime); err != nil && !acceptMalformedIndex {
+	if err := block.VerifyIndex(ctx, logger, filepath.Join(bdir, block.IndexFilename), m.MinTime, m.MaxTime); err != nil && !acceptMalformedIndex {
 		return errors.Wrap(err, "input block index not valid")
 	}
 
@@ -380,7 +382,7 @@ func processDownsampling(
 	}
 	defer runutil.CloseWithLogOnErr(log.With(logger, "outcome", "potential left mmap file handlers left"), b, "tsdb reader")
 
-	id, err := downsample.Downsample(logger, m, b, dir, resolution)
+	id, err := downsample.Downsample(ctx, logger, m, b, dir, resolution)
 	if err != nil {
 		return errors.Wrapf(err, "downsample block %s to window %d", m.ULID, resolution)
 	}
@@ -389,9 +391,9 @@ func processDownsampling(
 	downsampleDuration := time.Since(begin)
 	level.Info(logger).Log("msg", "downsampled block",
 		"from", m.ULID, "to", id, "duration", downsampleDuration, "duration_ms", downsampleDuration.Milliseconds())
-	metrics.downsampleDuration.WithLabelValues(m.Thanos.GroupKey()).Observe(downsampleDuration.Seconds())
+	metrics.downsampleDuration.WithLabelValues(m.Thanos.ResolutionString()).Observe(downsampleDuration.Seconds())
 
-	stats, err := block.GatherIndexHealthStats(logger, filepath.Join(resdir, block.IndexFilename), m.MinTime, m.MaxTime)
+	stats, err := block.GatherIndexHealthStats(ctx, logger, filepath.Join(resdir, block.IndexFilename), m.MinTime, m.MaxTime)
 	if err == nil {
 		err = stats.AnyErr()
 	}
@@ -418,7 +420,7 @@ func processDownsampling(
 
 	err = block.Upload(ctx, logger, bkt, resdir, hashFunc)
 	if err != nil {
-		return errors.Wrapf(err, "upload downsampled block %s", id)
+		return compact.NewRetryError(errors.Wrapf(err, "upload downsampled block %s", id))
 	}
 
 	level.Info(logger).Log("msg", "uploaded block", "id", id, "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds())

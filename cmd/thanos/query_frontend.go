@@ -16,6 +16,8 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/thanos-io/promql-engine/execution/parse"
 	"github.com/weaveworks/common/user"
 	"gopkg.in/yaml.v2"
 
@@ -25,6 +27,7 @@ import (
 	cortexvalidation "github.com/thanos-io/thanos/internal/cortex/util/validation"
 	"github.com/thanos-io/thanos/pkg/api"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/exthttp"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
@@ -33,14 +36,15 @@ import (
 	"github.com/thanos-io/thanos/pkg/queryfrontend"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/server/http/middleware"
+	"github.com/thanos-io/thanos/pkg/tenancy"
 	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 type queryFrontendConfig struct {
+	queryfrontend.Config
 	http           httpConfig
 	webDisableCORS bool
-	queryfrontend.Config
-	orgIdHeaders []string
+	orgIdHeaders   []string
 }
 
 func registerQueryFrontend(app *extkingpin.App) {
@@ -89,6 +93,9 @@ func registerQueryFrontend(app *extkingpin.App) {
 
 	cmd.Flag("query-range.max-retries-per-request", "Maximum number of retries for a single query range request; beyond this, the downstream error is returned.").
 		Default("5").IntVar(&cfg.QueryRangeConfig.MaxRetries)
+
+	cmd.Flag("query-frontend.enable-x-functions", "Enable experimental x- functions in query-frontend. --no-query-frontend.enable-x-functions for disabling.").
+		Default("false").BoolVar(&cfg.EnableXFunctions)
 
 	cmd.Flag("query-range.max-query-length", "Limit the query time range (end - start time) in the query-frontend, 0 disables it.").
 		Default("0").DurationVar((*time.Duration)(&cfg.QueryRangeConfig.Limits.MaxQueryLength))
@@ -139,14 +146,24 @@ func registerQueryFrontend(app *extkingpin.App) {
 	cmd.Flag("query-frontend.log-queries-longer-than", "Log queries that are slower than the specified duration. "+
 		"Set to 0 to disable. Set to < 0 to enable on all queries.").Default("0").DurationVar(&cfg.CortexHandlerConfig.LogQueriesLongerThan)
 
-	cmd.Flag("query-frontend.org-id-header", "Request header names used to identify the source of slow queries (repeated flag). "+
+	cmd.Flag("query-frontend.force-query-stats", "Enables query statistics for all queries and will export statistics as logs and service headers.").Default("false").BoolVar(&cfg.CortexHandlerConfig.QueryStatsEnabled)
+
+	cmd.Flag("query-frontend.org-id-header", "Deprecation Warning - This flag will be soon deprecated in favor of query-frontend.tenant-header"+
+		" and both flags cannot be used at the same time. "+
+		"Request header names used to identify the source of slow queries (repeated flag). "+
 		"The values of the header will be added to the org id field in the slow query log. "+
 		"If multiple headers match the request, the first matching arg specified will take precedence. "+
 		"If no headers match 'anonymous' will be used.").PlaceHolder("<http-header-name>").StringsVar(&cfg.orgIdHeaders)
 
 	cmd.Flag("query-frontend.forward-header", "List of headers forwarded by the query-frontend to downstream queriers, default is empty").PlaceHolder("<http-header-name>").StringsVar(&cfg.ForwardHeaders)
 
+	cmd.Flag("query-frontend.tenant-header", "HTTP header to determine tenant").Default(tenancy.DefaultTenantHeader).Hidden().StringVar(&cfg.TenantHeader)
+	cmd.Flag("query-frontend.default-tenant-id", "Default tenant ID to use if tenant header is not present").Default(tenancy.DefaultTenant).Hidden().StringVar(&cfg.DefaultTenant)
+	cmd.Flag("query-frontend.tenant-certificate-field", "Use TLS client's certificate field to determine tenant for requests. Must be one of "+tenancy.CertificateFieldOrganization+", "+tenancy.CertificateFieldOrganizationalUnit+" or "+tenancy.CertificateFieldCommonName+". This setting will cause the query-frontend.tenant-header flag value to be ignored.").Hidden().Default("").EnumVar(&cfg.TenantCertField, "", tenancy.CertificateFieldOrganization, tenancy.CertificateFieldOrganizationalUnit, tenancy.CertificateFieldCommonName)
+
 	cmd.Flag("query-frontend.vertical-shards", "Number of shards to use when distributing shardable PromQL queries. For more details, you can refer to the Vertical query sharding proposal: https://thanos.io/tip/proposals-accepted/202205-vertical-query-sharding.md").IntVar(&cfg.NumShards)
+
+	cmd.Flag("query-frontend.slow-query-logs-user-header", "Set the value of the field remote_user in the slow query logs to the value of the given HTTP header. Falls back to reading the user from the basic auth header.").PlaceHolder("<http-header-name>").Default("").StringVar(&cfg.CortexHandlerConfig.SlowQueryLogsUserHeader)
 
 	reqLogConfig := extkingpin.RegisterRequestLoggingFlags(cmd)
 
@@ -181,6 +198,13 @@ func parseTransportConfiguration(downstreamTripperConfContentYaml []byte) (*http
 			return nil, errors.Wrap(err, "parsing downstream tripper config YAML file")
 		}
 
+		if tripperConfig.TLSConfig != nil {
+			tlsConfig, err := exthttp.NewTLSConfig(tripperConfig.TLSConfig)
+			if err != nil {
+				return nil, errors.Wrap(err, "parsing downstream tripper TLS config YAML")
+			}
+			downstreamTripper.TLSClientConfig = tlsConfig
+		}
 		if tripperConfig.IdleConnTimeout > 0 {
 			downstreamTripper.IdleConnTimeout = time.Duration(tripperConfig.IdleConnTimeout)
 		}
@@ -216,6 +240,26 @@ func runQueryFrontend(
 	cfg *queryFrontendConfig,
 	comp component.Component,
 ) error {
+	tenantHeaderProvided := cfg.TenantHeader != "" && cfg.TenantHeader != tenancy.DefaultTenantHeader
+	// If tenant header is set and different from the default tenant header, add it to the list of org id headers.
+	// In this case we don't need to add the tenant header to `cfg.ForwardHeaders` because tripperware will modify
+	// the request, renaming the tenant header to the default tenant header, before the header propagation logic runs.
+	// TODO: This should be removed once the org id header is fully removed in Thanos.
+	if tenantHeaderProvided {
+		// If tenant header is provided together with the org id header, error out.
+		if len(cfg.orgIdHeaders) != 0 {
+			return errors.New("query-frontend.org-id-header and query-frontend.tenant-header cannot be used together")
+		}
+
+		cfg.orgIdHeaders = append(cfg.orgIdHeaders, cfg.TenantHeader)
+	}
+
+	// Temporarily manually adding the default tenant header into the list of headers to forward and org id headers.
+	// This facilitates the transition from org id to tenant id with minimal amount of changes.
+	cfg.ForwardHeaders = append(cfg.ForwardHeaders, tenancy.DefaultTenantHeader)
+	// TODO: This should be removed once the org id header is fully removed in Thanos.
+	cfg.orgIdHeaders = append(cfg.orgIdHeaders, tenancy.DefaultTenantHeader)
+
 	queryRangeCacheConfContentYaml, err := cfg.QueryRangeConfig.CachePathOrContent.Content()
 	if err != nil {
 		return err
@@ -226,8 +270,9 @@ func runQueryFrontend(
 			return errors.Wrap(err, "initializing the query range cache config")
 		}
 		cfg.QueryRangeConfig.ResultsCacheConfig = &queryrange.ResultsCacheConfig{
-			Compression: cfg.CacheCompression,
-			CacheConfig: *cacheConfig,
+			Compression:                cfg.CacheCompression,
+			CacheConfig:                *cacheConfig,
+			CacheQueryableSamplesStats: cfg.CortexHandlerConfig.QueryStatsEnabled,
 		}
 	}
 
@@ -248,6 +293,12 @@ func runQueryFrontend(
 
 	if err := cfg.Validate(); err != nil {
 		return errors.Wrap(err, "error validating the config")
+	}
+
+	if cfg.EnableXFunctions {
+		for fname, v := range parse.XFunctions {
+			parser.Functions[fname] = v
+		}
 	}
 
 	tripperWare, err := queryfrontend.NewTripperware(cfg.Config, reg, logger)
@@ -287,7 +338,7 @@ func runQueryFrontend(
 
 	// Configure Request Logging for HTTP calls.
 	logMiddleware := logging.NewHTTPServerMiddleware(logger, httpLogOpts...)
-	ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
+	ins := extpromhttp.NewTenantInstrumentationMiddleware(cfg.TenantHeader, cfg.DefaultTenant, reg, nil)
 
 	// Start metrics HTTP server.
 	{
@@ -304,19 +355,17 @@ func runQueryFrontend(
 				if !cfg.webDisableCORS {
 					api.SetCORS(w)
 				}
-				tracing.HTTPMiddleware(
-					tracer,
-					name,
-					logger,
-					ins.NewHandler(
+				middleware.RequestID(
+					tracing.HTTPMiddleware(
+						tracer,
 						name,
-						gzhttp.GzipHandler(
-							middleware.RequestID(
-								logMiddleware.HTTPMiddleware(name, f),
-							),
+						logger,
+						ins.NewHandler(
+							name,
+							logMiddleware.HTTPMiddleware(name, f),
 						),
+						// Cortex frontend middlewares require orgID.
 					),
-					// Cortex frontend middlewares require orgID.
 				).ServeHTTP(w, r.WithContext(user.InjectOrgID(r.Context(), orgId)))
 			})
 			return hf

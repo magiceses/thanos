@@ -28,6 +28,8 @@ import (
 // this many times and within different interval e.g
 // TODO(bwplotka): Add benchmarks with PromQL involvement.
 func TestQuerySelect(t *testing.T) {
+	t.Parallel()
+
 	tb := testutil.NewTB(t)
 	storetestutil.RunSeriesInterestingCases(tb, 200e3, 200e3, func(t testutil.TB, samplesPerSeries, series int) {
 		benchQuerySelect(t, samplesPerSeries, series, true)
@@ -84,7 +86,6 @@ func benchQuerySelect(t testutil.TB, totalSamples, totalSeries int, dedup bool) 
 
 	logger := log.NewNopLogger()
 	q := newQuerier(
-		context.Background(),
 		logger,
 		math.MinInt64,
 		math.MaxInt64,
@@ -93,7 +94,6 @@ func benchQuerySelect(t testutil.TB, totalSamples, totalSeries int, dedup bool) 
 		newProxyStore(&mockedStoreServer{responses: resps}),
 		dedup,
 		0,
-		false,
 		false,
 		false,
 		gate.NewNoop(),
@@ -129,8 +129,9 @@ func testSelect(t testutil.TB, q *querier, expectedSeries []labels.Labels) {
 	t.Run("select", func(t testutil.TB) {
 		t.ResetTimer()
 
+		ctx := context.Background()
 		for i := 0; i < t.N(); i++ {
-			ss := q.Select(true, nil, &labels.Matcher{Value: "foo", Name: "bar", Type: labels.MatchEqual})
+			ss := q.Select(ctx, true, nil, &labels.Matcher{Value: "foo", Name: "bar", Type: labels.MatchEqual})
 			testutil.Ok(t, ss.Err())
 			testutil.Equals(t, 0, len(ss.Warnings()))
 

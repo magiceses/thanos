@@ -11,6 +11,7 @@ import (
 
 	"github.com/efficientgo/e2e"
 	e2emon "github.com/efficientgo/e2e/monitoring"
+	e2eobs "github.com/efficientgo/e2e/observable"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/timestamp"
 
@@ -27,8 +28,8 @@ const (
 func TestExemplarsAPI_Fanout(t *testing.T) {
 	t.Parallel()
 	var (
-		prom1, prom2       *e2emon.InstrumentedRunnable
-		sidecar1, sidecar2 *e2emon.InstrumentedRunnable
+		prom1, prom2       *e2eobs.Observable
+		sidecar1, sidecar2 *e2eobs.Observable
 		err                error
 		e                  *e2e.DockerEnvironment
 	)
@@ -81,14 +82,14 @@ config:
 	t.Cleanup(cancel)
 
 	testutil.Ok(t, q.WaitSumMetricsWithOptions(e2emon.Equals(2), []string{"thanos_store_nodes_grpc_connections"}, e2emon.WaitMissingMetrics()))
-	testutil.Ok(t, q.WaitSumMetricsWithOptions(e2emon.Equals(2), []string{"thanos_query_exemplar_apis_dns_provider_results"}, e2emon.WaitMissingMetrics()))
+	testutil.Ok(t, q.WaitSumMetricsWithOptions(e2emon.Equals(2), []string{"thanos_query_endpoints_dns_provider_results"}, e2emon.WaitMissingMetrics()))
 
 	now := time.Now()
 	start := timestamp.FromTime(now.Add(-time.Hour))
 	end := timestamp.FromTime(now.Add(time.Hour))
 
 	// Send HTTP requests to thanos query to trigger exemplars.
-	labelNames(t, ctx, q.Endpoint("http"), nil, start, end, func(res []string) bool { return true })
+	labelNames(t, ctx, q.Endpoint("http"), nil, start, end, 0, func(res []string) bool { return true })
 
 	t.Run("Basic exemplars query", func(t *testing.T) {
 		queryExemplars(t, ctx, q.Endpoint("http"), `http_request_duration_seconds_bucket{handler="label_names"}`, start, end, exemplarsOnExpectedSeries(map[string]string{

@@ -44,9 +44,11 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	"github.com/prometheus/prometheus/tsdb/tsdbutil"
+	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/util/annotations"
 	promgate "github.com/prometheus/prometheus/util/gate"
 	"github.com/prometheus/prometheus/util/stats"
+	"github.com/thanos-io/promql-engine/engine"
 	baseAPI "github.com/thanos-io/thanos/pkg/api"
 	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/component"
@@ -183,12 +185,10 @@ func TestQueryEndpoints(t *testing.T) {
 
 	now := time.Now()
 	timeout := 100 * time.Second
-	ef := NewQueryEngineFactory(promql.EngineOpts{
-		Logger:     nil,
-		Reg:        nil,
+	ef := NewQueryEngineFactory(engine.Opts{EngineOpts: promql.EngineOpts{
 		MaxSamples: 10000,
 		Timeout:    timeout,
-	}, nil)
+	}}, nil)
 	api := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
@@ -337,6 +337,7 @@ func TestQueryEndpoints(t *testing.T) {
 				},
 			},
 		},
+
 		// Query endpoint with single deduplication label.
 		{
 			endpoint: api.query,
@@ -628,10 +629,157 @@ func TestQueryEndpoints(t *testing.T) {
 	}
 }
 
+func TestQueryExplainEndpoints(t *testing.T) {
+	db, err := e2eutil.NewTSDB()
+	defer func() { testutil.Ok(t, db.Close()) }()
+	testutil.Ok(t, err)
+
+	now := time.Now()
+	timeout := 100 * time.Second
+	ef := NewQueryEngineFactory(engine.Opts{EngineOpts: promql.EngineOpts{
+		MaxSamples: 10000,
+		Timeout:    timeout,
+	}}, nil)
+	api := &QueryAPI{
+		baseAPI: &baseAPI.BaseAPI{
+			Now: func() time.Time { return now },
+		},
+		queryableCreate:       query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout),
+		engineFactory:         ef,
+		defaultEngine:         PromqlEnginePrometheus,
+		lookbackDeltaCreate:   func(m int64) time.Duration { return time.Duration(0) },
+		gate:                  gate.New(nil, 4, gate.Queries),
+		defaultRangeQueryStep: time.Second,
+		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
+			Name: "query_range_hist",
+		}),
+		seriesStatsAggregatorFactory: &store.NoopSeriesStatsAggregatorFactory{},
+		tenantHeader:                 "thanos-tenant",
+		defaultTenant:                "default-tenant",
+	}
+
+	var tests = []endpointTestCase{
+		{
+			endpoint: api.queryExplain,
+			query: url.Values{
+				"query":  []string{"2"},
+				"time":   []string{"123.4"},
+				"engine": []string{"thanos"},
+			},
+			response: &engine.ExplainOutputNode{
+				OperatorName: "[numberLiteral] 2",
+			},
+		},
+		{
+			endpoint: api.queryRangeExplain,
+			query: url.Values{
+				"query":  []string{"time()"},
+				"start":  []string{"0"},
+				"end":    []string{"500"},
+				"step":   []string{"1"},
+				"engine": []string{"thanos"},
+			},
+			response: &engine.ExplainOutputNode{
+				OperatorName: "[duplicateLabelCheck]",
+				Children: []engine.ExplainOutputNode{
+					{
+						OperatorName: "[noArgFunction]",
+					},
+				},
+			},
+		},
+	}
+	for i, test := range tests {
+		if ok := testEndpoint(t, test, fmt.Sprintf("#%d %s", i, test.query.Encode()), reflect.DeepEqual); !ok {
+			return
+		}
+	}
+}
+
+func TestQueryAnalyzeEndpoints(t *testing.T) {
+	db, err := e2eutil.NewTSDB()
+	defer func() { testutil.Ok(t, db.Close()) }()
+	testutil.Ok(t, err)
+
+	now := time.Now()
+	timeout := 100 * time.Second
+	ef := NewQueryEngineFactory(engine.Opts{EngineOpts: promql.EngineOpts{
+		MaxSamples: 10000,
+		Timeout:    timeout,
+	}}, nil)
+	api := &QueryAPI{
+		baseAPI: &baseAPI.BaseAPI{
+			Now: func() time.Time { return now },
+		},
+		queryableCreate:       query.NewQueryableCreator(nil, nil, newProxyStoreWithTSDBStore(db), 2, timeout),
+		engineFactory:         ef,
+		defaultEngine:         PromqlEnginePrometheus,
+		lookbackDeltaCreate:   func(m int64) time.Duration { return time.Duration(0) },
+		gate:                  gate.New(nil, 4, gate.Queries),
+		defaultRangeQueryStep: time.Second,
+		queryRangeHist: promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{
+			Name: "query_range_hist",
+		}),
+		seriesStatsAggregatorFactory: &store.NoopSeriesStatsAggregatorFactory{},
+		tenantHeader:                 "thanos-tenant",
+		defaultTenant:                "default-tenant",
+	}
+	start := time.Unix(0, 0)
+
+	var tests = []endpointTestCase{
+		{
+			endpoint: api.query,
+			query: url.Values{
+				"query":  []string{"2"},
+				"time":   []string{"123.4"},
+				"engine": []string{"thanos"},
+			},
+			response: &queryData{
+				ResultType: parser.ValueTypeScalar,
+				Result: promql.Scalar{
+					V: 2,
+					T: timestamp.FromTime(start.Add(123*time.Second + 400*time.Millisecond)),
+				},
+				QueryAnalysis: queryTelemetry{},
+			},
+		},
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"time()"},
+				"start": []string{"0"},
+				"end":   []string{"500"},
+				"step":  []string{"1"},
+			},
+			response: &queryData{
+				ResultType: parser.ValueTypeMatrix,
+				Result: promql.Matrix{
+					promql.Series{
+						Floats: func(end, step float64) []promql.FPoint {
+							var res []promql.FPoint
+							for v := float64(0); v <= end; v += step {
+								res = append(res, promql.FPoint{F: v, T: timestamp.FromTime(start.Add(time.Duration(v) * time.Second))})
+							}
+							return res
+						}(500, 1),
+						Metric: nil,
+					},
+				},
+				QueryAnalysis: queryTelemetry{},
+			},
+		},
+	}
+	for i, test := range tests {
+		if ok := testEndpoint(t, test, fmt.Sprintf("#%d %s", i, test.query.Encode()), reflect.DeepEqual); !ok {
+			return
+		}
+	}
+}
+
 func newProxyStoreWithTSDBStore(db store.TSDBReader) *store.ProxyStore {
 	c := &storetestutil.TestClient{
 		Name:        "1",
-		StoreClient: storepb.ServerAsClient(store.NewTSDBStore(nil, db, component.Query, nil), 0),
+		StoreClient: storepb.ServerAsClient(store.NewTSDBStore(nil, db, component.Query, nil)),
 		MinTime:     math.MinInt64, MaxTime: math.MaxInt64,
 	}
 
@@ -691,7 +839,7 @@ func TestMetadataEndpoints(t *testing.T) {
 	var series []storage.Series
 
 	for _, lbl := range old {
-		var samples []tsdbutil.Sample
+		var samples []chunks.Sample
 
 		for i := int64(0); i < 10; i++ {
 			samples = append(samples, sample{
@@ -727,12 +875,10 @@ func TestMetadataEndpoints(t *testing.T) {
 
 	now := time.Now()
 	timeout := 100 * time.Second
-	ef := NewQueryEngineFactory(promql.EngineOpts{
-		Logger:     nil,
-		Reg:        nil,
+	ef := NewQueryEngineFactory(engine.Opts{EngineOpts: promql.EngineOpts{
 		MaxSamples: 10000,
 		Timeout:    timeout,
-	}, nil)
+	}}, nil)
 	api := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
@@ -884,6 +1030,15 @@ func TestMetadataEndpoints(t *testing.T) {
 			},
 			response: []string{"__name__", "foo", "replica1"},
 		},
+		// With limit
+		{
+			endpoint: api.labelNames,
+			query: url.Values{
+				"match[]": []string{`test_metric_replica2`},
+				"limit":   []string{"2"},
+			},
+			response: []string{"__name__", "foo"},
+		},
 		{
 			endpoint: api.labelValues,
 			query: url.Values{
@@ -903,6 +1058,18 @@ func TestMetadataEndpoints(t *testing.T) {
 				"name": "__name__",
 			},
 			response: []string{"test_metric1", "test_metric2", "test_metric_replica1", "test_metric_replica2"},
+		},
+		// With limit
+		{
+			endpoint: api.labelValues,
+			query: url.Values{
+				"match[]": []string{`{foo="bar"}`, `{foo="boo"}`},
+				"limit":   []string{"3"},
+			},
+			params: map[string]string{
+				"name": "__name__",
+			},
+			response: []string{"test_metric1", "test_metric2", "test_metric_replica1"},
 		},
 		// No matched series.
 		{
@@ -1202,6 +1369,32 @@ func TestMetadataEndpoints(t *testing.T) {
 			},
 			errType: baseAPI.ErrorBadData,
 			method:  http.MethodPost,
+		},
+		// With limit
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`{replica="", foo=~"b.+", replica1=""}`},
+				"limit":   []string{"2"},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric1", "foo", "bar"),
+				labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+			},
+			method: http.MethodPost,
+		},
+		// Without limit
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`{replica="", foo=~"b.+", replica1=""}`},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric1", "foo", "bar"),
+				labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+				labels.FromStrings("__name__", "test_metric2", "foo", "boo"),
+			},
+			method: http.MethodPost,
 		},
 	}
 
@@ -1521,6 +1714,16 @@ func TestParseStoreDebugMatchersParam(t *testing.T) {
 				labels.MustNewMatcher(labels.MatchEqual, "cluster", "test"),
 			}},
 		},
+		{
+			storeMatchers: `{__address__=~"localhost:.*"}`,
+			fail:          false,
+			result:        [][]*labels.Matcher{{labels.MustNewMatcher(labels.MatchRegexp, "__address__", "localhost:.*")}},
+		},
+		{
+			storeMatchers: `{__address__!~"localhost:.*"}`,
+			fail:          false,
+			result:        [][]*labels.Matcher{{labels.MustNewMatcher(labels.MatchNotRegexp, "__address__", "localhost:.*")}},
+		},
 	} {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			api := QueryAPI{
@@ -1535,12 +1738,61 @@ func TestParseStoreDebugMatchersParam(t *testing.T) {
 
 			storeMatchers, err := api.parseStoreDebugMatchersParam(r)
 			if !tc.fail {
-				testutil.Equals(t, tc.result, storeMatchers)
+				testutil.Equals(t, len(tc.result), len(storeMatchers))
+				for i, m := range tc.result {
+					testutil.Equals(t, len(m), len(storeMatchers[i]))
+					for j, n := range m {
+						testutil.Equals(t, n.String(), storeMatchers[i][j].String())
+					}
+				}
 				testutil.Equals(t, (*baseAPI.ApiError)(nil), err)
 			} else {
 				testutil.NotOk(t, err)
 			}
+
+			// We don't care about results but checking for panic.
+			for _, matchers := range storeMatchers {
+				for _, matcher := range matchers {
+					_ = matcher.Matches("")
+				}
+			}
 		})
+	}
+}
+
+func TestParseLimitParam(t *testing.T) {
+	var tests = []struct {
+		input  string
+		fail   bool
+		result int
+	}{
+		{
+			input:  "",
+			fail:   false,
+			result: 0,
+		}, {
+			input: "abc",
+			fail:  true,
+		}, {
+			input:  "10",
+			fail:   false,
+			result: 10,
+		},
+	}
+
+	for _, test := range tests {
+		res, err := parseLimitParam(test.input)
+		if err != nil && !test.fail {
+			t.Errorf("Unexpected error for %q: %s", test.input, err)
+			continue
+		}
+		if err == nil && test.fail {
+			t.Errorf("Expected error for %q but got none", test.input)
+			continue
+		}
+		if !test.fail && res != test.result {
+			t.Errorf("Expected limit %v for input %q but got %v", test.result, test.input, res)
+		}
 	}
 }
 
@@ -1571,6 +1823,7 @@ func TestRulesHandler(t *testing.T) {
 			Health:                    "x",
 			Query:                     "sum(up2) == 2",
 			DurationSeconds:           101,
+			KeepFiringForSeconds:      102,
 			Labels:                    labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: "some", Value: "label3"}}},
 			Annotations:               labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: "ann", Value: "a1"}}},
 			Alerts: []*rulespb.AlertInstance{
@@ -1601,8 +1854,20 @@ func TestRulesHandler(t *testing.T) {
 			EvaluationDurationSeconds: 122,
 			Health:                    "x",
 			DurationSeconds:           102,
+			KeepFiringForSeconds:      103,
 			Query:                     "sum(up3) == 3",
 			Labels:                    labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: "some", Value: "label4"}}},
+			State:                     rulespb.AlertState_INACTIVE,
+		}),
+		rulespb.NewAlertingRule(&rulespb.Alert{
+			Name:                      "5",
+			LastEvaluation:            time.Time{}.Add(4 * time.Minute),
+			EvaluationDurationSeconds: 122,
+			Health:                    "x",
+			DurationSeconds:           61,
+			KeepFiringForSeconds:      62,
+			Query:                     "sum(up4) == 4",
+			Labels:                    labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: "some", Value: "label5"}}},
 			State:                     rulespb.AlertState_INACTIVE,
 		}),
 	}
@@ -1690,6 +1955,7 @@ func TestRulesHandler(t *testing.T) {
 			LastEvaluation: all[2].GetAlert().LastEvaluation,
 			EvaluationTime: all[2].GetAlert().EvaluationDurationSeconds,
 			Duration:       all[2].GetAlert().DurationSeconds,
+			KeepFiringFor:  all[2].GetAlert().KeepFiringForSeconds,
 			Annotations:    labelpb.ZLabelsToPromLabels(all[2].GetAlert().Annotations.Labels),
 			Alerts: []*testpromcompatibility.Alert{
 				{
@@ -1721,6 +1987,22 @@ func TestRulesHandler(t *testing.T) {
 			LastEvaluation: all[3].GetAlert().LastEvaluation,
 			EvaluationTime: all[3].GetAlert().EvaluationDurationSeconds,
 			Duration:       all[3].GetAlert().DurationSeconds,
+			KeepFiringFor:  all[3].GetAlert().KeepFiringForSeconds,
+			Annotations:    nil,
+			Alerts:         []*testpromcompatibility.Alert{},
+			Type:           "alerting",
+		},
+		testpromcompatibility.AlertingRule{
+			State:          strings.ToLower(all[4].GetAlert().State.String()),
+			Name:           all[4].GetAlert().Name,
+			Query:          all[4].GetAlert().Query,
+			Labels:         labelpb.ZLabelsToPromLabels(all[4].GetAlert().Labels.Labels),
+			Health:         rules.RuleHealth(all[2].GetAlert().Health),
+			LastError:      all[4].GetAlert().LastError,
+			LastEvaluation: all[4].GetAlert().LastEvaluation,
+			EvaluationTime: all[4].GetAlert().EvaluationDurationSeconds,
+			Duration:       all[4].GetAlert().DurationSeconds,
+			KeepFiringFor:  all[4].GetAlert().KeepFiringForSeconds,
 			Annotations:    nil,
 			Alerts:         []*testpromcompatibility.Alert{},
 			Type:           "alerting",
@@ -1797,7 +2079,7 @@ func TestRulesHandler(t *testing.T) {
 			}
 			res, errors, apiError, releaseResources := endpoint(req.WithContext(ctx))
 			defer releaseResources()
-			if errors != nil {
+			if len(errors) > 0 {
 				t.Fatalf("Unexpected errors: %s", errors)
 				return
 			}
@@ -1850,11 +2132,11 @@ func BenchmarkQueryResultEncoding(b *testing.B) {
 
 type mockedRulesClient struct {
 	g   map[rulespb.RulesRequest_Type][]*rulespb.RuleGroup
-	w   storage.Warnings
+	w   annotations.Annotations
 	err error
 }
 
-func (c mockedRulesClient) Rules(_ context.Context, req *rulespb.RulesRequest) (*rulespb.RuleGroups, storage.Warnings, error) {
+func (c mockedRulesClient) Rules(_ context.Context, req *rulespb.RulesRequest) (*rulespb.RuleGroups, annotations.Annotations, error) {
 	return &rulespb.RuleGroups{Groups: c.g[req.Type]}, c.w, c.err
 }
 

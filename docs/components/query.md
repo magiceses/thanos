@@ -103,17 +103,7 @@ thanos query \
 
 This logic can also be controlled via parameter on QueryAPI. More details below.
 
-### Deduplication on non-external labels
-
-In `v0.31.0` we have implemented an [optimization](../proposals-accepted/20221129-avoid-global-sort.md) which broke deduplication on non-external labels. We think that it was just a coincidence that deduplication worked at all on non-external labels in previous versions.
-
-External labels always override any labels a series might have and this makes it so that it is possible to remove replica labels on series returned by a StoreAPI as an optimization. If deduplication happens on internal labels then that might lead to unsorted series from a StoreAPI and that breaks deduplication.
-
-To fix this use-case, in 0.32.0 we've implemented a cuckoo filter on label names that is updated every 10 seconds. Using it we can detect whether deduplication was requested on internal labels. If that is the case then the series set is resorted before being sent off to the querier. It is strongly recommended to set replica labels which are external labels because otherwise the optimization cannot be applied and your queries will be slower by 20-30%.
-
-In the future we have plans to expose this cuckoo filter through the InfoAPI. This will allow better scoping queries to StoreAPIs.
-
-## Experimental PromQL Engine
+## Thanos PromQL Engine (experimental)
 
 By default, Thanos querier comes with standard Prometheus PromQL engine. However, when `--query.promql-engine=thanos` is specified, Thanos will use [experimental Thanos PromQL engine](http://github.com/thanos-community/promql-engine) which is a drop-in, efficient implementation of PromQL engine with query planner and optimizers.
 
@@ -122,6 +112,14 @@ To learn more, see [the introduction talk](https://youtu.be/pjkWzDVxWk4?t=3609) 
 This feature is still **experimental** given active development. All queries should be supported due to bulit-in fallback to old PromQL if something is not yet implemented.
 
 For new engine bugs/issues, please use https://github.com/thanos-community/promql-engine GitHub issues.
+
+### Distributed execution mode
+
+When using Thanos PromQL Engine the distributed execution mode can be enabled using `--query.mode=distributed`. When this mode is enabled, the Querier will break down each query into independent fragments and delegate them to components which implement the Query API.
+
+This mode is particularly useful in architectures where multiple independent Queriers are deployed in separate environments (different regions or different Kubernetes clusters) and are federated through a separate central Querier. A Querier running in the distributed mode will only talk to Queriers, or other components which implement the Query API. Endpoints which only act as Stores (e.g. Store Gateways or Rulers), and are directly connected to a distributed Querier, will not be included in the execution of a distributed query. This constraint should help with keeping the distributed query execution simple and efficient, but could be removed in the future if there are good use cases for it.
+
+For further details on the design and use cases of this feature, see the [official design document](https://thanos.io/tip/proposals-done/202301-distributed-query-execution.md/).
 
 ## Query API Overview
 
@@ -192,7 +190,7 @@ Available options:
 
 ### Partial Response Strategy
 
-// TODO(bwplotka): Update. This will change to "strategy" soon as [PartialResponseStrategy enum here](../../pkg/store/storepb/rpc.proto)
+ <!-- TODO(bwplotka): Update. This will change to "strategy" soon as [PartialResponseStrategy enum here](../../pkg/store/storepb/rpc.proto) -->
 
 | HTTP URL/FORM parameter | Type      | Default                                       | Example                                |
 |-------------------------|-----------|-----------------------------------------------|----------------------------------------|
@@ -270,6 +268,20 @@ Example file SD file in YAML:
 
 `--query.active-query-path` is an option which allows the user to specify a directory which will contain a `queries.active` file to track active queries. To enable this feature, the user has to specify a directory other than "", since that is skipped being the default.
 
+## Tenancy
+
+### Tenant Metrics
+
+Tenant information is captured in relevant Thanos exported metrics in the Querier, Query Frontend and Store. In order make use of this functionality requests to the Query/Query Frontend component should include the tenant-id in the appropriate HTTP request header as configured with `--query.tenant-header`. The tenant information is passed through components (including Query Frontend), down to the Thanos Store, enabling per-tenant metrics in these components also. If no tenant header is set to requests to the query component, the default tenant as defined by `--query.tenant-default-id` will be used.
+
+### Tenant Enforcement
+
+Enforcement of tenancy can be enabled using `--query.enforce-tenancy`. If enabled, queries will only fetch series containing a specific matcher, while evaluating PromQL expressions. The matcher label name is `--query.tenant-label-name` and the matcher value matches the tenant, as sent to the querier in the HTTP header configured with `--query-tenant-header`. This functionality requires that metrics are injected with a tenant label when ingested into Thanos. This can be done for example by enabling tenancy in the Thanos Receive component.
+
+In case of nested Thanos Query components, it's important to note that tenancy enforcement will only occur in the querier which the initial request is sent to, the layered queriers will not perform any enforcement.
+
+Further, note that there are no authentication mechanisms in Thanos, so anyone can set an arbitrary tenant in the HTTP header. It is recommended to use a proxy in front of the querier in case an authentication mechanism is needed. The Query UI also includes an option to set an arbitrary tenant, and should therefore not be exposed to end-users if users should not be able to see each others data.
+
 ## Flags
 
 ```$ mdox-exec="thanos query --help"
@@ -282,30 +294,42 @@ Flags:
       --alert.query-url=ALERT.QUERY-URL
                                  The external Thanos Query URL that would be set
                                  in all alerts 'Source' field.
-      --enable-feature= ...      Comma separated experimental feature names
-                                 to enable.The current list of features is
-                                 query-pushdown.
-      --endpoint=<endpoint> ...  Addresses of statically configured Thanos
-                                 API servers (repeatable). The scheme may be
-                                 prefixed with 'dns+' or 'dnssrv+' to detect
-                                 Thanos API servers through respective DNS
-                                 lookups.
+      --auto-gomemlimit.ratio=0.9
+                                 The ratio of reserved GOMEMLIMIT memory to the
+                                 detected maximum container or system memory.
+      --enable-auto-gomemlimit   Enable go runtime to automatically limit memory
+                                 consumption.
+      --endpoint=<endpoint> ...  (Deprecated): Addresses of statically
+                                 configured Thanos API servers (repeatable).
+                                 The scheme may be prefixed with 'dns+' or
+                                 'dnssrv+' to detect Thanos API servers through
+                                 respective DNS lookups.
       --endpoint-group=<endpoint-group> ...
-                                 Experimental: DNS name of statically configured
-                                 Thanos API server groups (repeatable). Targets
-                                 resolved from the DNS name will be queried in
-                                 a round-robin, instead of a fanout manner.
-                                 This flag should be used when connecting a
-                                 Thanos Query to HA groups of Thanos components.
+                                 (Deprecated, Experimental): DNS name of
+                                 statically configured Thanos API server groups
+                                 (repeatable). Targets resolved from the DNS
+                                 name will be queried in a round-robin, instead
+                                 of a fanout manner. This flag should be used
+                                 when connecting a Thanos Query to HA groups of
+                                 Thanos components.
       --endpoint-group-strict=<endpoint-group-strict> ...
-                                 Experimental: DNS name of statically configured
-                                 Thanos API server groups (repeatable) that are
-                                 always used, even if the health check fails.
-      --endpoint-strict=<staticendpoint> ...
-                                 Addresses of only statically configured Thanos
-                                 API servers that are always used, even if
-                                 the health check fails. Useful if you have a
-                                 caching layer on top.
+                                 (Deprecated, Experimental): DNS name of
+                                 statically configured Thanos API server groups
+                                 (repeatable) that are always used, even if the
+                                 health check fails.
+      --endpoint-strict=<endpoint-strict> ...
+                                 (Deprecated): Addresses of only statically
+                                 configured Thanos API servers that are always
+                                 used, even if the health check fails. Useful if
+                                 you have a caching layer on top.
+      --endpoint.sd-config=<content>
+                                 Alternative to 'endpoint.sd-config-file' flag
+                                 (mutually exclusive). Content of Config File
+                                 with endpoint definitions
+      --endpoint.sd-config-file=<file-path>
+                                 Path to Config File with endpoint definitions
+      --endpoint.sd-config-reload-interval=5m
+                                 Interval between endpoint config refreshes
       --grpc-address="0.0.0.0:10901"
                                  Listen ip:port address for gRPC endpoints
                                  (StoreAPI). Make sure this address is routable
@@ -339,6 +363,11 @@ Flags:
                                  verification on server side. (tls.NoClientCert)
       --grpc-server-tls-key=""   TLS Key for the gRPC server, leave blank to
                                  disable TLS
+      --grpc-server-tls-min-version="1.3"
+                                 TLS supported minimum version for gRPC server.
+                                 If no version is specified, it'll default to
+                                 1.3. Allowed values: ["1.0", "1.1", "1.2",
+                                 "1.3"]
   -h, --help                     Show context-sensitive help (also try
                                  --help-long and --help-man).
       --http-address="0.0.0.0:10902"
@@ -370,6 +399,17 @@ Flags:
                                  = max(rangeSeconds / 250, defaultStep)).
                                  This will not work from Grafana, but Grafana
                                  has __step variable which can be used.
+      --query.default-tenant-id="default-tenant"
+                                 Default tenant ID to use if tenant header is
+                                 not present
+      --query.enable-x-functions
+                                 Whether to enable extended rate functions
+                                 (xrate, xincrease and xdelta). Only has effect
+                                 when used with Thanos engine.
+      --query.enforce-tenancy    Enforce tenancy on Query APIs. Responses
+                                 are returned only if the label value of the
+                                 configured tenant-label-name and the value of
+                                 the tenant header matches.
       --query.lookback-delta=QUERY.LOOKBACK-DELTA
                                  The maximum lookback duration for retrieving
                                  metrics during expression evaluations.
@@ -394,9 +434,23 @@ Flags:
                                  when the range parameters are not specified.
                                  The zero value means range covers the time
                                  since the beginning.
+      --query.mode=local         PromQL query mode. One of: local, distributed.
       --query.partial-response   Enable partial response for queries if
                                  no partial_response param is specified.
                                  --no-query.partial-response for disabling.
+      --query.partition-label=QUERY.PARTITION-LABEL ...
+                                 Labels that partition the leaf queriers. This
+                                 is used to scope down the labelsets of leaf
+                                 queriers when using the distributed query mode.
+                                 If set, these labels must form a partition
+                                 of the leaf queriers. Partition labels must
+                                 not intersect with replica labels. Every TSDB
+                                 of a leaf querier must have these labels.
+                                 This is useful when there are multiple external
+                                 labels that are irrelevant for the partition as
+                                 it allows the distributed engine to ignore them
+                                 for some optimizations. If this is empty then
+                                 all labels are used as partition labels.
       --query.promql-engine=prometheus
                                  Default PromQL engine to use.
       --query.replica-label=QUERY.REPLICA-LABEL ...
@@ -405,6 +459,8 @@ Flags:
                                  be able to query without deduplication using
                                  'dedup=false' parameter. Data includes time
                                  series, recording rules, and alerting rules.
+                                 Flag may be specified multiple times as well as
+                                 a comma separated list of labels.
       --query.telemetry.request-duration-seconds-quantiles=0.1... ...
                                  The quantiles for exporting metrics about the
                                  request duration quantiles.
@@ -414,6 +470,17 @@ Flags:
       --query.telemetry.request-series-seconds-quantiles=10... ...
                                  The quantiles for exporting metrics about the
                                  series count quantiles.
+      --query.tenant-certificate-field=
+                                 Use TLS client's certificate field to determine
+                                 tenant for write requests. Must be one of
+                                 organization, organizationalUnit or commonName.
+                                 This setting will cause the query.tenant-header
+                                 flag value to be ignored.
+      --query.tenant-header="THANOS-TENANT"
+                                 HTTP header to determine tenant.
+      --query.tenant-label-name="tenant_id"
+                                 Label name to use when enforcing tenancy (if
+                                 --query.enforce-tenancy is enabled).
       --query.timeout=2m         Maximum time to process query by query node.
       --request.logging-config=<content>
                                  Alternative to 'request.logging-config-file'
@@ -428,19 +495,21 @@ Flags:
       --selector-label=<name>="<value>" ...
                                  Query selector labels that will be exposed in
                                  info endpoint (repeated).
-      --store=<store> ...        Deprecation Warning - This flag is deprecated
-                                 and replaced with `endpoint`. Addresses of
-                                 statically configured store API servers
-                                 (repeatable). The scheme may be prefixed with
-                                 'dns+' or 'dnssrv+' to detect store API servers
-                                 through respective DNS lookups.
-      --store-strict=<staticstore> ...
-                                 Deprecation Warning - This flag is deprecated
-                                 and replaced with `endpoint-strict`. Addresses
-                                 of only statically configured store API servers
-                                 that are always used, even if the health check
-                                 fails. Useful if you have a caching layer on
-                                 top.
+      --selector.relabel-config=<content>
+                                 Alternative to 'selector.relabel-config-file'
+                                 flag (mutually exclusive). Content of YAML
+                                 file with relabeling configuration that allows
+                                 selecting blocks to query based on their
+                                 external labels. It follows the Thanos sharding
+                                 relabel-config syntax. For format details see:
+                                 https://thanos.io/tip/thanos/sharding.md/#relabelling
+      --selector.relabel-config-file=<file-path>
+                                 Path to YAML file with relabeling
+                                 configuration that allows selecting blocks
+                                 to query based on their external labels.
+                                 It follows the Thanos sharding relabel-config
+                                 syntax. For format details see:
+                                 https://thanos.io/tip/thanos/sharding.md/#relabelling
       --store.limits.request-samples=0
                                  The maximum samples allowed for a single
                                  Series request, The Series call fails if
@@ -460,11 +529,11 @@ Flags:
       --store.sd-dns-interval=30s
                                  Interval between DNS resolutions.
       --store.sd-files=<path> ...
-                                 Path to files that contain addresses of store
-                                 API servers. The path can be a glob pattern
-                                 (repeatable).
-      --store.sd-interval=5m     Refresh interval to re-read file SD files.
-                                 It is used as a resync fallback.
+                                 (Deprecated) Path to files that contain
+                                 addresses of store API servers. The path can be
+                                 a glob pattern (repeatable).
+      --store.sd-interval=5m     (Deprecated) Refresh interval to re-read file
+                                 SD files. It is used as a resync fallback.
       --store.unhealthy-timeout=5m
                                  Timeout before an unhealthy store is cleaned
                                  from the store UI page.

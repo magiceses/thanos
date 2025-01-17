@@ -59,28 +59,28 @@ func (c *swappableCache) SwapWith(ptr2 storecache.IndexCache) {
 	c.ptr = ptr2
 }
 
-func (c *swappableCache) StorePostings(blockID ulid.ULID, l labels.Label, v []byte) {
-	c.ptr.StorePostings(blockID, l, v)
+func (c *swappableCache) StorePostings(blockID ulid.ULID, l labels.Label, v []byte, tenant string) {
+	c.ptr.StorePostings(blockID, l, v, tenant)
 }
 
-func (c *swappableCache) FetchMultiPostings(ctx context.Context, blockID ulid.ULID, keys []labels.Label) (map[labels.Label][]byte, []labels.Label) {
-	return c.ptr.FetchMultiPostings(ctx, blockID, keys)
+func (c *swappableCache) FetchMultiPostings(ctx context.Context, blockID ulid.ULID, keys []labels.Label, tenant string) (map[labels.Label][]byte, []labels.Label) {
+	return c.ptr.FetchMultiPostings(ctx, blockID, keys, tenant)
 }
 
-func (c *swappableCache) StoreExpandedPostings(blockID ulid.ULID, matchers []*labels.Matcher, v []byte) {
-	c.ptr.StoreExpandedPostings(blockID, matchers, v)
+func (c *swappableCache) StoreExpandedPostings(blockID ulid.ULID, matchers []*labels.Matcher, v []byte, tenant string) {
+	c.ptr.StoreExpandedPostings(blockID, matchers, v, tenant)
 }
 
-func (c *swappableCache) FetchExpandedPostings(ctx context.Context, blockID ulid.ULID, matchers []*labels.Matcher) ([]byte, bool) {
-	return c.ptr.FetchExpandedPostings(ctx, blockID, matchers)
+func (c *swappableCache) FetchExpandedPostings(ctx context.Context, blockID ulid.ULID, matchers []*labels.Matcher, tenant string) ([]byte, bool) {
+	return c.ptr.FetchExpandedPostings(ctx, blockID, matchers, tenant)
 }
 
-func (c *swappableCache) StoreSeries(blockID ulid.ULID, id storage.SeriesRef, v []byte) {
-	c.ptr.StoreSeries(blockID, id, v)
+func (c *swappableCache) StoreSeries(blockID ulid.ULID, id storage.SeriesRef, v []byte, tenant string) {
+	c.ptr.StoreSeries(blockID, id, v, tenant)
 }
 
-func (c *swappableCache) FetchMultiSeries(ctx context.Context, blockID ulid.ULID, ids []storage.SeriesRef) (map[storage.SeriesRef][]byte, []storage.SeriesRef) {
-	return c.ptr.FetchMultiSeries(ctx, blockID, ids)
+func (c *swappableCache) FetchMultiSeries(ctx context.Context, blockID ulid.ULID, ids []storage.SeriesRef, tenant string) (map[storage.SeriesRef][]byte, []storage.SeriesRef) {
+	return c.ptr.FetchMultiSeries(ctx, blockID, ids, tenant)
 }
 
 type storeSuite struct {
@@ -153,7 +153,9 @@ func prepareStoreWithTestBlocks(t testing.TB, dir string, bkt objstore.Bucket, m
 		maxTime: maxTime,
 	}
 
-	metaFetcher, err := block.NewMetaFetcher(s.logger, 20, objstore.WithNoopInstr(bkt), dir, nil, []block.MetadataFilter{
+	insBkt := objstore.WithNoopInstr(bkt)
+	baseBlockIDsFetcher := block.NewConcurrentLister(s.logger, insBkt)
+	metaFetcher, err := block.NewMetaFetcher(s.logger, 20, insBkt, baseBlockIDsFetcher, dir, nil, []block.MetadataFilter{
 		block.NewTimePartitionMetaFilter(filterConf.MinTime, filterConf.MaxTime),
 		block.NewLabelShardedMetaFilter(relabelConfig),
 	})
@@ -553,6 +555,8 @@ func TestBucketStore_ManyParts_e2e(t *testing.T) {
 }
 
 func TestBucketStore_TimePartitioning_e2e(t *testing.T) {
+	t.Parallel()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	bkt := objstore.NewInMemBucket()
@@ -606,6 +610,8 @@ func TestBucketStore_TimePartitioning_e2e(t *testing.T) {
 }
 
 func TestBucketStore_Series_ChunksLimiter_e2e(t *testing.T) {
+	t.Parallel()
+
 	// The query will fetch 2 series from 6 blocks, so we do expect to hit a total of 12 chunks.
 	expectedChunks := uint64(2 * 6)
 
@@ -673,6 +679,48 @@ func TestBucketStore_Series_ChunksLimiter_e2e(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBucketStore_Series_CustomBytesLimiters_e2e(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bkt := objstore.NewInMemBucket()
+
+	dir := t.TempDir()
+
+	s := prepareStoreWithTestBlocks(t, dir, bkt, false, NewChunksLimiterFactory(0), NewSeriesLimiterFactory(0), func(_ prometheus.Counter) BytesLimiter {
+		return &bytesLimiterMock{
+			limitFunc: func(_ uint64, dataType StoreDataType) error {
+				if dataType == PostingsFetched {
+					return fmt.Errorf("error reserving data type: PostingsFetched")
+				}
+
+				return nil
+			},
+		}
+	}, emptyRelabelConfig, allowAllFilterConf)
+	testutil.Ok(t, s.store.SyncBlocks(ctx))
+
+	req := &storepb.SeriesRequest{
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "1"},
+		},
+		MinTime: minTimeDuration.PrometheusTimestamp(),
+		MaxTime: maxTimeDuration.PrometheusTimestamp(),
+	}
+
+	s.cache.SwapWith(noopCache{})
+	srv := newStoreSeriesServer(ctx)
+	err := s.store.Series(req, srv)
+
+	testutil.NotOk(t, err)
+	testutil.Assert(t, strings.Contains(err.Error(), "exceeded bytes limit"))
+	testutil.Assert(t, strings.Contains(err.Error(), "error reserving data type: PostingsFetched"))
+	status, ok := status.FromError(err)
+	testutil.Equals(t, true, ok)
+	testutil.Equals(t, codes.ResourceExhausted, status.Code())
 }
 
 func TestBucketStore_LabelNames_e2e(t *testing.T) {
@@ -779,31 +827,9 @@ func TestBucketStore_LabelNames_e2e(t *testing.T) {
 	})
 }
 
-func TestBucketStore_LabelNamesSet_e2e(t *testing.T) {
-	objtesting.ForeachStore(t, func(t *testing.T, bkt objstore.Bucket) {
-		dir := t.TempDir()
-
-		s := prepareStoreWithTestBlocks(t, dir, bkt, false, NewChunksLimiterFactory(0), NewSeriesLimiterFactory(0), NewBytesLimiterFactory(0), emptyRelabelConfig, allowAllFilterConf)
-		s.cache.SwapWith(noopCache{})
-
-		mint, maxt := s.store.TimeRange()
-		testutil.Equals(t, s.minTime, mint)
-		testutil.Equals(t, s.maxTime, maxt)
-
-		s.store.UpdateLabelNames()
-		for _, b := range s.store.blocks {
-			waitTimeout(t, &b.pendingReaders, 5*time.Second)
-		}
-
-		filter := s.store.LabelNamesSet()
-		for _, n := range []string{"a", "b", "c"} {
-			testutil.Assert(t, filter.Has(n), "expected filter to have %s", n)
-		}
-		testutil.Equals(t, 3, filter.Count())
-	})
-}
-
 func TestBucketStore_LabelNames_SeriesLimiter_e2e(t *testing.T) {
+	t.Parallel()
+
 	cases := map[string]struct {
 		maxSeriesLimit uint64
 		expectedErr    string
@@ -962,6 +988,8 @@ func TestBucketStore_LabelValues_e2e(t *testing.T) {
 }
 
 func TestBucketStore_LabelValues_SeriesLimiter_e2e(t *testing.T) {
+	t.Parallel()
+
 	cases := map[string]struct {
 		maxSeriesLimit uint64
 		expectedErr    string

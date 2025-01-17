@@ -19,7 +19,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sony/gobreaker"
+	"github.com/thanos-io/thanos/pkg/clientconfig"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
+	memcacheDiscovery "github.com/thanos-io/thanos/pkg/discovery/memcache"
+	"github.com/thanos-io/thanos/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/extprom"
 )
 
 // MemcachedClient interface exists for mocking memcacheClient.
@@ -45,7 +49,7 @@ type memcachedClient struct {
 	service  string
 
 	addresses []string
-	provider  *dns.Provider
+	provider  clientconfig.AddressProvider
 
 	cbs        map[ /*address*/ string]*gobreaker.CircuitBreaker
 	cbFailures uint
@@ -68,6 +72,7 @@ type MemcachedClientConfig struct {
 	Host           string        `yaml:"host"`
 	Service        string        `yaml:"service"`
 	Addresses      string        `yaml:"addresses"` // EXPERIMENTAL.
+	AutoDiscovery  bool          `yaml:"auto_discovery"`
 	Timeout        time.Duration `yaml:"timeout"`
 	MaxIdleConns   int           `yaml:"max_idle_conns"`
 	MaxItemSize    int           `yaml:"max_item_size"`
@@ -107,9 +112,19 @@ func NewMemcachedClient(cfg MemcachedClientConfig, name string, r prometheus.Reg
 	client.Timeout = cfg.Timeout
 	client.MaxIdleConns = cfg.MaxIdleConns
 
-	dnsProviderRegisterer := prometheus.WrapRegistererWithPrefix("cortex_", prometheus.WrapRegistererWith(prometheus.Labels{
-		"name": name,
-	}, r))
+	var addressProvider clientconfig.AddressProvider
+	if cfg.AutoDiscovery {
+		addressProvider = memcacheDiscovery.NewProvider(
+			logger,
+			extprom.WrapRegistererWithPrefix("cortex_", r),
+			cfg.Timeout,
+		)
+	} else {
+		dnsProviderRegisterer := prometheus.WrapRegistererWithPrefix("cortex_", prometheus.WrapRegistererWith(prometheus.Labels{
+			"name": name,
+		}, r))
+		addressProvider = dns.NewProvider(logger, dnsProviderRegisterer, dns.GolangResolverType)
+	}
 
 	newClient := &memcachedClient{
 		name:        name,
@@ -118,7 +133,7 @@ func NewMemcachedClient(cfg MemcachedClientConfig, name string, r prometheus.Reg
 		hostname:    cfg.Host,
 		service:     cfg.Service,
 		logger:      logger,
-		provider:    dns.NewProvider(logger, dnsProviderRegisterer, dns.GolangResolverType),
+		provider:    addressProvider,
 		cbs:         make(map[string]*gobreaker.CircuitBreaker),
 		cbFailures:  cfg.CBFailures,
 		cbInterval:  cfg.CBInterval,
@@ -188,6 +203,28 @@ func (c *memcachedClient) dialViaCircuitBreaker(network, address string, timeout
 	return conn.(net.Conn), nil
 }
 
+func (c *memcachedClient) Set(item *memcache.Item) error {
+	// Skip hitting memcached at all if the item is bigger than the max allowed size.
+	if c.maxItemSize > 0 && len(item.Value) > c.maxItemSize {
+		c.skipped.Inc()
+		return nil
+	}
+
+	err := c.Client.Set(item)
+	if err == nil {
+		return nil
+	}
+
+	// Inject the server address in order to have more information about which memcached
+	// backend server failed. This is a best effort.
+	addr, addrErr := c.serverList.PickServer(item.Key)
+	if addrErr != nil {
+		return err
+	}
+
+	return errors.Wrapf(err, "server=%s", addr)
+}
+
 func (c *memcachedClient) updateLoop(updateInterval time.Duration) {
 	defer c.wait.Done()
 	ticker := time.NewTicker(updateInterval)
@@ -214,7 +251,7 @@ func (c *memcachedClient) updateMemcacheServers() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		if err := c.provider.Resolve(ctx, c.addresses); err != nil {
+		if err := c.provider.Resolve(ctx, c.addresses, true); err != nil {
 			return err
 		}
 		servers = c.provider.Addresses()

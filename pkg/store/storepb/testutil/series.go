@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cespare/xxhash"
+	"github.com/cespare/xxhash/v2"
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/types"
@@ -40,9 +40,9 @@ const (
 	LabelLongSuffix = "aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd"
 )
 
-func allPostings(t testing.TB, ix tsdb.IndexReader) index.Postings {
+func allPostings(ctx context.Context, t testing.TB, ix tsdb.IndexReader) index.Postings {
 	k, v := index.AllPostingsKey()
-	p, err := ix.Postings(k, v)
+	p, err := ix.Postings(ctx, k, v)
 	testutil.Ok(t, err)
 	return p
 }
@@ -68,9 +68,10 @@ func CreateBlockFromHead(t testing.TB, dir string, head *tsdb.Head) ulid.ULID {
 
 	// Add +1 millisecond to block maxt because block intervals are half-open: [b.MinTime, b.MaxTime).
 	// Because of this block intervals are always +1 than the total samples it includes.
-	ulid, err := compactor.Write(dir, head, head.MinTime(), head.MaxTime()+1, nil)
+	ulids, err := compactor.Write(dir, head, head.MinTime(), head.MaxTime()+1, nil)
 	testutil.Ok(t, err)
-	return ulid
+	testutil.Assert(t, len(ulids) > 0)
+	return ulids[0]
 }
 
 // CreateHeadWithSeries returns head filled with given samples and same series returned in separate list for assertion purposes.
@@ -120,6 +121,8 @@ func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head,
 			appendFloatSamples(t, app, tsLabel, opts)
 		case chunkenc.ValHistogram:
 			appendHistogramSamples(t, app, tsLabel, opts)
+		case chunkenc.ValFloatHistogram:
+			appendFloatHistogramSamples(t, app, tsLabel, opts)
 		}
 	}
 	testutil.Ok(t, app.Commit())
@@ -138,25 +141,25 @@ func ReadSeriesFromBlock(t testing.TB, h tsdb.BlockReader, extLabels labels.Labe
 	defer func() { testutil.Ok(t, ir.Close()) }()
 
 	var (
-		lset       labels.Labels
 		chunkMetas []chunks.Meta
 		expected   = make([]*storepb.Series, 0)
 	)
 
 	var builder labels.ScratchBuilder
 
-	all := allPostings(t, ir)
+	all := allPostings(context.TODO(), t, ir)
 	for all.Next() {
 		testutil.Ok(t, ir.Series(all.At(), &builder, &chunkMetas))
-		lset = builder.Labels()
-		expected = append(expected, &storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(append(extLabels.Copy(), lset...))})
+		lset := labelpb.ExtendSortedLabels(builder.Labels(), extLabels)
+		expected = append(expected, &storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(lset)})
 
 		if skipChunks {
 			continue
 		}
 
 		for _, c := range chunkMetas {
-			chEnc, err := chks.Chunk(c)
+			// Ignore iterable as it happens in OOOHead only.
+			chEnc, _, err := chks.ChunkOrIterable(c)
 			testutil.Ok(t, err)
 
 			// Open Chunk.
@@ -189,7 +192,7 @@ func appendFloatSamples(t testing.TB, app storage.Appender, tsLabel int, opts He
 	testutil.Ok(t, err)
 
 	for is := 1; is < opts.SamplesPerSeries; is++ {
-		_, err := app.Append(ref, nil, int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), opts.Random.Float64())
+		_, err := app.Append(ref, labels.EmptyLabels(), int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), opts.Random.Float64())
 		testutil.Ok(t, err)
 	}
 }
@@ -197,7 +200,7 @@ func appendFloatSamples(t testing.TB, app storage.Appender, tsLabel int, opts He
 func appendHistogramSamples(t testing.TB, app storage.Appender, tsLabel int, opts HeadGenOptions) {
 	sample := &histogram.Histogram{
 		Schema:        0,
-		Count:         9,
+		Count:         20,
 		Sum:           -3.1415,
 		ZeroCount:     12,
 		ZeroThreshold: 0.001,
@@ -218,7 +221,40 @@ func appendHistogramSamples(t testing.TB, app storage.Appender, tsLabel int, opt
 	testutil.Ok(t, err)
 
 	for is := 1; is < opts.SamplesPerSeries; is++ {
-		_, err := app.AppendHistogram(ref, nil, int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), sample, nil)
+		_, err := app.AppendHistogram(ref, labels.EmptyLabels(), int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), sample, nil)
+		testutil.Ok(t, err)
+	}
+}
+
+func appendFloatHistogramSamples(t testing.TB, app storage.Appender, tsLabel int, opts HeadGenOptions) {
+	sample := &histogram.FloatHistogram{
+		ZeroThreshold: 0.01,
+		ZeroCount:     5.5,
+		Count:         15,
+		Sum:           11.5,
+		PositiveSpans: []histogram.Span{
+			{Offset: -2, Length: 2},
+			{Offset: 1, Length: 3},
+		},
+		PositiveBuckets: []float64{0.5, 0, 1.5, 2, 3.5},
+		NegativeSpans: []histogram.Span{
+			{Offset: 3, Length: 2},
+			{Offset: 3, Length: 2},
+		},
+		NegativeBuckets: []float64{1.5, 0.5, 2.5, 3},
+	}
+
+	ref, err := app.AppendHistogram(
+		0,
+		labels.FromStrings("foo", "bar", "i", fmt.Sprintf("%07d%s", tsLabel, LabelLongSuffix), "j", fmt.Sprintf("%v", tsLabel)),
+		int64(tsLabel)*opts.ScrapeInterval.Milliseconds(),
+		nil,
+		sample,
+	)
+	testutil.Ok(t, err)
+
+	for is := 1; is < opts.SamplesPerSeries; is++ {
+		_, err := app.AppendHistogram(ref, labels.EmptyLabels(), int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), nil, sample)
 		testutil.Ok(t, err)
 	}
 }
@@ -328,7 +364,7 @@ func TestServerSeries(t testutil.TB, store storepb.StoreServer, cases ...*Series
 					// Huge responses can produce unreadable diffs - make it more human readable.
 					if len(c.ExpectedSeries) > 4 {
 						for j := range c.ExpectedSeries {
-							testutil.Equals(t, c.ExpectedSeries[j].Labels, srv.SeriesSet[j].Labels, "%v series chunks mismatch", j)
+							testutil.Equals(t, c.ExpectedSeries[j].Labels, srv.SeriesSet[j].Labels)
 
 							// Check chunks when it is not a skip chunk query
 							if !c.Req.SkipChunks {
@@ -341,7 +377,10 @@ func TestServerSeries(t testutil.TB, store storepb.StoreServer, cases ...*Series
 							}
 						}
 					} else {
-						testutil.Equals(t, c.ExpectedSeries, srv.SeriesSet)
+						testutil.Equals(t, true, len(c.ExpectedSeries) == len(srv.SeriesSet))
+						for i := range c.ExpectedSeries {
+							testutil.Equals(t, c.ExpectedSeries[i], srv.SeriesSet[i])
+						}
 					}
 
 					var actualHints []hintspb.SeriesResponseHints

@@ -279,6 +279,18 @@ usage: thanos compact [<flags>]
 Continuously compacts blocks in an object store bucket.
 
 Flags:
+      --auto-gomemlimit.ratio=0.9
+                                The ratio of reserved GOMEMLIMIT memory to the
+                                detected maximum container or system memory.
+      --block-discovery-strategy="concurrent"
+                                One of concurrent, recursive. When set to
+                                concurrent, stores will concurrently issue
+                                one call per directory to discover active
+                                blocks in the bucket. The recursive strategy
+                                iterates through all objects in the bucket,
+                                recursively traversing into each directory.
+                                This avoids N+1 calls at the expense of having
+                                slower bucket iterations.
       --block-files-concurrency=1
                                 Number of goroutines to use when
                                 fetching/uploading block files from object
@@ -330,14 +342,16 @@ Flags:
                                 At least one replica label has to be set via
                                 --deduplication.replica-label flag.
       --deduplication.replica-label=DEDUPLICATION.REPLICA-LABEL ...
-                                Label to treat as a replica indicator of blocks
-                                that can be deduplicated (repeated flag). This
-                                will merge multiple replica blocks into one.
-                                This process is irreversible.Experimental.
-                                When one or more labels are set, compactor
-                                will ignore the given labels so that vertical
-                                compaction can merge the blocks.Please note
-                                that by default this uses a NAIVE algorithm
+                                Experimental. Label to treat as a replica
+                                indicator of blocks that can be deduplicated
+                                (repeated flag). This will merge multiple
+                                replica blocks into one. This process is
+                                irreversible. Flag may be specified multiple
+                                times as well as a comma separated list of
+                                labels. When one or more labels are set,
+                                compactor will ignore the given labels so that
+                                vertical compaction can merge the blocks.Please
+                                note that by default this uses a NAIVE algorithm
                                 for merging which works well for deduplication
                                 of blocks with **precisely the same samples**
                                 like produced by Receiver replication.If you
@@ -366,6 +380,8 @@ Flags:
                                 non-downsampled data is not efficient and useful
                                 e.g it is not possible to render all samples for
                                 a human eye anyway
+      --enable-auto-gomemlimit  Enable go runtime to automatically limit memory
+                                consumption.
       --hash-func=              Specify which hash function to use when
                                 calculating the hashes of produced files.
                                 If no function has been specified, it does not
@@ -423,18 +439,19 @@ Flags:
                                 resolution forever
       --selector.relabel-config=<content>
                                 Alternative to 'selector.relabel-config-file'
-                                flag (mutually exclusive). Content of
-                                YAML file that contains relabeling
-                                configuration that allows selecting
-                                blocks. It follows native Prometheus
-                                relabel-config syntax. See format details:
-                                https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config
+                                flag (mutually exclusive). Content of YAML
+                                file with relabeling configuration that allows
+                                selecting blocks to act on based on their
+                                external labels. It follows thanos sharding
+                                relabel-config syntax. For format details see:
+                                https://thanos.io/tip/thanos/sharding.md/#relabelling
       --selector.relabel-config-file=<file-path>
-                                Path to YAML file that contains relabeling
-                                configuration that allows selecting
-                                blocks. It follows native Prometheus
-                                relabel-config syntax. See format details:
-                                https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config
+                                Path to YAML file with relabeling
+                                configuration that allows selecting blocks
+                                to act on based on their external labels.
+                                It follows thanos sharding relabel-config
+                                syntax. For format details see:
+                                https://thanos.io/tip/thanos/sharding.md/#relabelling
       --tracing.config=<content>
                                 Alternative to 'tracing.config-file' flag
                                 (mutually exclusive). Content of YAML file

@@ -117,8 +117,8 @@ eval instant at 10m rate(testcounter_zero_cutoff[20m])
 	{start="0m"} 0.5
 	{start="1m"} 0.55
 	{start="2m"} 0.6
-	{start="3m"} 0.65
-	{start="4m"} 0.7
+	{start="3m"} 0.6
+	{start="4m"} 0.6
 	{start="5m"} 0.6
 
 # Normal half-interval cutoff for left-side extrapolation.
@@ -745,10 +745,10 @@ clear
 eval instant at 50m absent(sum(nonexistent{job="testjob", instance="testinstance"}))
 	{} 1
 
-eval instant at 50m absent(max(nonexistant))
+eval instant at 50m absent(max(nonexistent))
 	{} 1
 
-eval instant at 50m absent(nonexistant > 1)
+eval instant at 50m absent(nonexistent > 1)
 	{} 1
 
 eval instant at 50m absent(a + b)
@@ -757,7 +757,7 @@ eval instant at 50m absent(a + b)
 eval instant at 50m absent(a and b)
 	{} 1
 
-eval instant at 50m absent(rate(nonexistant[5m]))
+eval instant at 50m absent(rate(nonexistent[5m]))
 	{} 1
 
 clear
@@ -775,7 +775,7 @@ eval instant at 1m absent_over_time(http_requests{handler!="/foo"}[5m])
 eval instant at 1m absent_over_time(http_requests{handler="/foo", handler="/bar", handler="/foobar"}[5m])
     {} 1
 
-eval instant at 1m absent_over_time(rate(nonexistant[5m])[5m:])
+eval instant at 1m absent_over_time(rate(nonexistent[5m])[5m:])
     {} 1
 
 eval instant at 1m absent_over_time(http_requests{handler="/foo", handler="/bar", instance="127.0.0.1"}[5m])

@@ -22,6 +22,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/common/version"
 	"go.uber.org/automaxprocs/maxprocs"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -49,6 +50,10 @@ func main() {
 		Default(logging.LogFormatLogfmt).Enum(logging.LogFormatLogfmt, logging.LogFormatJSON)
 	tracingConfig := extkingpin.RegisterCommonTracingFlags(app)
 
+	goMemLimitConf := goMemLimitConfig{}
+
+	goMemLimitConf.registerFlag(app)
+
 	registerSidecar(app)
 	registerStore(app)
 	registerQuery(app)
@@ -61,10 +66,15 @@ func main() {
 	cmd, setup := app.Parse()
 	logger := logging.NewLogger(*logLevel, *logFormat, *debugName)
 
+	if err := configureGoAutoMemLimit(goMemLimitConf); err != nil {
+		level.Error(logger).Log("msg", "failed to configure Go runtime memory limits", "err", err)
+		os.Exit(1)
+	}
+
 	// Running in container with limits but with empty/wrong value of GOMAXPROCS env var could lead to throttling by cpu
 	// maxprocs will automate adjustment by using cgroups info about cpu limit if it set as value for runtime.GOMAXPROCS.
 	undo, err := maxprocs.Set(maxprocs.Logger(func(template string, args ...interface{}) {
-		level.Debug(logger).Log("msg", fmt.Sprintf(template, args))
+		level.Debug(logger).Log("msg", fmt.Sprintf(template, args...))
 	}))
 	defer undo()
 	if err != nil {
@@ -73,7 +83,7 @@ func main() {
 
 	metrics := prometheus.NewRegistry()
 	metrics.MustRegister(
-		version.NewCollector("thanos"),
+		versioncollector.NewCollector("thanos"),
 		collectors.NewGoCollector(
 			collectors.WithGoCollectorRuntimeMetrics(collectors.GoRuntimeMetricsRule{Matcher: regexp.MustCompile("/.*")}),
 		),
@@ -202,6 +212,11 @@ func getFlagsMap(flags []*kingpin.FlagModel) map[string]string {
 
 	for _, f := range flags {
 		if boilerplateFlags.GetFlag(f.Name) != nil {
+			continue
+		}
+		// Mask inline objstore flag which can have credentials.
+		if f.Name == "objstore.config" || f.Name == "objstore.config-file" {
+			flagsMap[f.Name] = "<REDACTED>"
 			continue
 		}
 		flagsMap[f.Name] = f.Value.String()

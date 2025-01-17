@@ -28,6 +28,7 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/prometheus/prometheus/util/gate"
 
 	"github.com/thanos-io/thanos/pkg/component"
@@ -43,6 +44,8 @@ type sample struct {
 }
 
 func TestQueryableCreator_MaxResolution(t *testing.T) {
+	t.Parallel()
+
 	testProxy := &testStoreServer{resps: []*storepb.SeriesResponse{}}
 	queryableCreator := NewQueryableCreator(nil, nil, newProxyStore(testProxy), 2, 5*time.Second)
 
@@ -54,12 +57,11 @@ func TestQueryableCreator_MaxResolution(t *testing.T) {
 		oneHourMillis,
 		false,
 		false,
-		false,
 		nil,
 		NoopSeriesStatsReporter,
 	)
 
-	q, err := queryable.Querier(context.Background(), 0, 42)
+	q, err := queryable.Querier(0, 42)
 	testutil.Ok(t, err)
 	t.Cleanup(func() { testutil.Ok(t, q.Close()) })
 
@@ -72,6 +74,8 @@ func TestQueryableCreator_MaxResolution(t *testing.T) {
 
 // Tests E2E how PromQL works with downsampled data.
 func TestQuerier_DownsampledData(t *testing.T) {
+	t.Parallel()
+
 	testProxy := &testStoreServer{
 		resps: []*storepb.SeriesResponse{
 			storeSeriesResponse(t, labels.FromStrings("__name__", "a", "zzz", "a", "aaa", "bbb"), []sample{{99, 1}, {199, 5}}),                   // Downsampled chunk from Store.
@@ -94,7 +98,6 @@ func TestQuerier_DownsampledData(t *testing.T) {
 		nil,
 		nil,
 		9999999,
-		false,
 		false,
 		false,
 		nil,
@@ -336,6 +339,8 @@ func (s series) Iterator() chunkenc.Iterator {
 //
 // This is because when promql displays data for a given range it looks back 5min before the requested time window.
 func TestQuerier_Select_AfterPromQL(t *testing.T) {
+	t.Parallel()
+
 	logger := log.NewLogfmtLogger(os.Stderr)
 
 	for _, tcase := range []struct {
@@ -389,12 +394,12 @@ func TestQuerier_Select_AfterPromQL(t *testing.T) {
 				resolution := time.Duration(tcase.hints.Step) * time.Millisecond
 				t.Run(fmt.Sprintf("dedup=%v, resolution=%v", sc.dedup, resolution.String()), func(t *testing.T) {
 					var actual []series
-					// Boostrap a local store and pass the data through promql.
+					// Bootstrap a local store and pass the data through promql.
 					{
 						g := gate.New(2)
 						mq := &mockedQueryable{
 							Creator: func(mint, maxt int64) storage.Querier {
-								return newQuerier(context.Background(), nil, mint, maxt, tcase.replicaLabels, nil, tcase.storeAPI, sc.dedup, 0, true, false, false, g, timeout, nil, NoopSeriesStatsReporter)
+								return newQuerier(nil, mint, maxt, tcase.replicaLabels, nil, tcase.storeAPI, sc.dedup, 0, true, false, g, timeout, nil, NoopSeriesStatsReporter)
 							},
 						}
 						t.Cleanup(func() {
@@ -409,7 +414,7 @@ func TestQuerier_Select_AfterPromQL(t *testing.T) {
 						if tcase.expectedWarning != "" {
 							warns := res.Warnings
 							testutil.Assert(t, len(warns) == 1, "expected only single warnings")
-							testutil.Equals(t, tcase.expectedWarning, warns[0].Error())
+							testutil.Equals(t, tcase.expectedWarning, warns.AsErrors()[0])
 						}
 					}
 
@@ -424,6 +429,8 @@ func TestQuerier_Select_AfterPromQL(t *testing.T) {
 }
 
 func TestQuerier_Select(t *testing.T) {
+	t.Parallel()
+
 	logger := log.NewLogfmtLogger(os.Stderr)
 
 	for _, tcase := range []struct {
@@ -773,7 +780,6 @@ func TestQuerier_Select(t *testing.T) {
 			} {
 				g := gate.New(2)
 				q := newQuerier(
-					context.Background(),
 					nil,
 					tcase.mint,
 					tcase.maxt,
@@ -784,7 +790,6 @@ func TestQuerier_Select(t *testing.T) {
 					0,
 					true,
 					false,
-					false,
 					g,
 					timeout,
 					nil,
@@ -794,13 +799,13 @@ func TestQuerier_Select(t *testing.T) {
 
 				t.Run(fmt.Sprintf("dedup=%v", sc.dedup), func(t *testing.T) {
 					t.Run("querier.Select", func(t *testing.T) {
-						res := q.Select(false, tcase.hints, tcase.matchers...)
+						res := q.Select(context.Background(), false, tcase.hints, tcase.matchers...)
 						testSelectResponse(t, sc.expected, res)
 
 						if tcase.expectedWarning != "" {
-							w := res.Warnings()
-							testutil.Equals(t, 1, len(w))
-							testutil.Equals(t, tcase.expectedWarning, w[0].Error())
+							warns := res.Warnings()
+							testutil.Equals(t, 1, len(warns))
+							testutil.Equals(t, tcase.expectedWarning, warns.AsErrors()[0].Error())
 						}
 					})
 					// Integration test: Make sure the PromQL would select exactly the same.
@@ -817,13 +822,11 @@ func TestQuerier_Select(t *testing.T) {
 
 						warns := catcher.warns()
 						// We don't care about anything else, all should be recorded.
-						testutil.Assert(t, len(warns) == 1, "expected only single warnings")
 						testutil.Assert(t, len(catcher.resp) == 1, "expected only single response, subqueries?")
 
-						w := warns[0]
 						if tcase.expectedWarning != "" {
-							testutil.Equals(t, 1, len(w))
-							testutil.Equals(t, tcase.expectedWarning, w[0].Error())
+							testutil.Equals(t, 1, len(warns))
+							testutil.Equals(t, tcase.expectedWarning, warns.AsErrors()[0].Error())
 						}
 					})
 				})
@@ -841,7 +844,7 @@ func newProxyStore(storeAPIs ...storepb.StoreServer) *store.ProxyStore {
 		}
 		cls[i] = &storetestutil.TestClient{
 			Name:        fmt.Sprintf("%v", i),
-			StoreClient: storepb.ServerAsClient(s, 0),
+			StoreClient: storepb.ServerAsClient(s),
 			MinTime:     math.MinInt64, MaxTime: math.MaxInt64,
 			WithoutReplicaLabelsEnabled: withoutReplicaLabelsEnabled,
 		}
@@ -966,7 +969,7 @@ type mockedQueryable struct {
 
 // Querier creates a querier with the provided min and max time.
 // The promQL engine sets mint and it is calculated based on the default lookback delta.
-func (q *mockedQueryable) Querier(_ context.Context, mint, maxt int64) (storage.Querier, error) {
+func (q *mockedQueryable) Querier(mint, maxt int64) (storage.Querier, error) {
 	if q.Creator == nil {
 		return q.querier, nil
 	}
@@ -993,18 +996,18 @@ type querierResponseCatcher struct {
 	resp []storage.SeriesSet
 }
 
-func (q *querierResponseCatcher) Select(selectSorted bool, p *storage.SelectHints, m ...*labels.Matcher) storage.SeriesSet {
-	s := q.Querier.Select(selectSorted, p, m...)
+func (q *querierResponseCatcher) Select(ctx context.Context, selectSorted bool, p *storage.SelectHints, m ...*labels.Matcher) storage.SeriesSet {
+	s := q.Querier.Select(ctx, selectSorted, p, m...)
 	q.resp = append(q.resp, s)
 	return storage.NoopSeriesSet()
 }
 
 func (q querierResponseCatcher) Close() error { return nil }
 
-func (q *querierResponseCatcher) warns() []storage.Warnings {
-	var warns []storage.Warnings
+func (q *querierResponseCatcher) warns() annotations.Annotations {
+	var warns annotations.Annotations
 	for _, r := range q.resp {
-		warns = append(warns, r.Warnings())
+		warns.Merge(r.Warnings())
 	}
 	return warns
 }
@@ -1037,11 +1040,11 @@ func (s *mockedSeriesIterator) At() (t int64, v float64) {
 }
 
 // TODO(rabenhorst): Needs to be implemented for native histogram support.
-func (s *mockedSeriesIterator) AtHistogram() (int64, *histogram.Histogram) {
+func (s *mockedSeriesIterator) AtHistogram(*histogram.Histogram) (int64, *histogram.Histogram) {
 	panic("not implemented")
 }
 
-func (s *mockedSeriesIterator) AtFloatHistogram() (int64, *histogram.FloatHistogram) {
+func (s *mockedSeriesIterator) AtFloatHistogram(*histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
 	panic("not implemented")
 }
 
@@ -1061,6 +1064,8 @@ func (s *mockedSeriesIterator) Next() chunkenc.ValueType {
 func (s *mockedSeriesIterator) Err() error { return nil }
 
 func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
+	t.Parallel()
+
 	logger := log.NewLogfmtLogger(os.Stderr)
 
 	s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, nil, "./testdata/issue2401-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
@@ -1080,7 +1085,7 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 
 		timeout := 100 * time.Second
 		g := gate.New(2)
-		q := newQuerier(context.Background(), logger, realSeriesWithStaleMarkerMint, realSeriesWithStaleMarkerMaxt, []string{"replica"}, nil, newProxyStore(s), false, 0, true, false, false, g, timeout, nil, NoopSeriesStatsReporter)
+		q := newQuerier(logger, realSeriesWithStaleMarkerMint, realSeriesWithStaleMarkerMaxt, []string{"replica"}, nil, newProxyStore(s), false, 0, true, false, g, timeout, nil, NoopSeriesStatsReporter)
 		t.Cleanup(func() {
 			testutil.Ok(t, q.Close())
 		})
@@ -1101,7 +1106,7 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 			vec, err := r.Matrix()
 			testutil.Ok(t, err)
 			testutil.Equals(t, promql.Matrix{
-				{Metric: expectedLset1, Floats: []promql.FPoint{
+				{DropName: true, Metric: expectedLset1, Floats: []promql.FPoint{
 					{T: 1587690300000, F: 13.652631578947368}, {T: 1587690400000, F: 14.049122807017543}, {T: 1587690500000, F: 13.961403508771928}, {T: 1587690600000, F: 13.617543859649121}, {T: 1587690700000, F: 14.568421052631578}, {T: 1587690800000, F: 14.989473684210525},
 					{T: 1587690900000, F: 16.2}, {T: 1587691000000, F: 16.052631578947366}, {T: 1587691100000, F: 15.831578947368419}, {T: 1587691200000, F: 15.659649122807016}, {T: 1587691300000, F: 14.842105263157894}, {T: 1587691400000, F: 14.003508771929823},
 					{T: 1587691500000, F: 13.782456140350876}, {T: 1587691600000, F: 13.86315789473684}, {T: 1587691700000, F: 15.270282598474376}, {T: 1587691800000, F: 14.343859649122805}, {T: 1587691900000, F: 13.975438596491227}, {T: 1587692000000, F: 13.399999999999999},
@@ -1109,7 +1114,7 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 					{T: 1587692700000, F: 8.19298245614035}, {T: 1587692800000, F: 11.91870302641626}, {T: 1587692900000, F: 13.75813610765101}, {T: 1587693000000, F: 13.087719298245613}, {T: 1587693100000, F: 13.466666666666665}, {T: 1587693200000, F: 14.028070175438595},
 					{T: 1587693300000, F: 14.23859649122807}, {T: 1587693400000, F: 15.407017543859647}, {T: 1587693500000, F: 15.915789473684208}, {T: 1587693600000, F: 15.712280701754384},
 				}},
-				{Metric: expectedLset2, Floats: []promql.FPoint{
+				{DropName: true, Metric: expectedLset2, Floats: []promql.FPoint{
 					{T: 1587690300000, F: 13.691228070175438}, {T: 1587690400000, F: 14.098245614035086}, {T: 1587690500000, F: 13.905263157894735}, {T: 1587690600000, F: 13.617543859649121}, {T: 1587690700000, F: 14.350877192982455}, {T: 1587690800000, F: 15.003508771929823},
 					{T: 1587690900000, F: 16.12280701754386}, {T: 1587691000000, F: 16.049122807017543}, {T: 1587691100000, F: 15.922807017543859}, {T: 1587691200000, F: 15.63157894736842}, {T: 1587691300000, F: 14.982456140350875}, {T: 1587691400000, F: 14.187259188557553},
 					{T: 1587691500000, F: 13.828070175438596}, {T: 1587691600000, F: 13.971929824561402}, {T: 1587691700000, F: 15.31994329585807}, {T: 1587691800000, F: 14.30877192982456}, {T: 1587691900000, F: 13.915789473684208}, {T: 1587692000000, F: 13.312280701754384},
@@ -1130,10 +1135,10 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 			vec, err := r.Matrix()
 			testutil.Ok(t, err)
 			testutil.Equals(t, promql.Matrix{
-				{Metric: expectedLset1, Floats: []promql.FPoint{
+				{DropName: true, Metric: expectedLset1, Floats: []promql.FPoint{
 					{T: 1587691800000, F: 14.457142857142856}, {T: 1587692300000, F: 14.761904761904761}, {T: 1587692800000, F: 13.127170868347338}, {T: 1587693300000, F: 12.93501400560224},
 				}},
-				{Metric: expectedLset2, Floats: []promql.FPoint{
+				{DropName: true, Metric: expectedLset2, Floats: []promql.FPoint{
 					{T: 1587691800000, F: 14.464425770308122}, {T: 1587692300000, F: 14.763025210084033}, {T: 1587692800000, F: 13.148909112808576}, {T: 1587693300000, F: 12.92829131652661},
 				}},
 			}, vec)
@@ -1150,7 +1155,7 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 
 		timeout := 5 * time.Second
 		g := gate.New(2)
-		q := newQuerier(context.Background(), logger, realSeriesWithStaleMarkerMint, realSeriesWithStaleMarkerMaxt, []string{"replica"}, nil, newProxyStore(s), true, 0, true, false, false, g, timeout, nil, NoopSeriesStatsReporter)
+		q := newQuerier(logger, realSeriesWithStaleMarkerMint, realSeriesWithStaleMarkerMaxt, []string{"replica"}, nil, newProxyStore(s), true, 0, true, false, g, timeout, nil, NoopSeriesStatsReporter)
 		t.Cleanup(func() {
 			testutil.Ok(t, q.Close())
 		})
@@ -1171,7 +1176,7 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 			vec, err := r.Matrix()
 			testutil.Ok(t, err)
 			testutil.Equals(t, promql.Matrix{
-				{Metric: expectedLset, Floats: []promql.FPoint{
+				{DropName: true, Metric: expectedLset, Floats: []promql.FPoint{
 					{T: 1587690300000, F: 13.691228070175438}, {T: 1587690400000, F: 14.098245614035086}, {T: 1587690500000, F: 13.905263157894735}, {T: 1587690600000, F: 13.617543859649121},
 					{T: 1587690700000, F: 14.350877192982455}, {T: 1587690800000, F: 15.003508771929823}, {T: 1587690900000, F: 16.12280701754386}, {T: 1587691000000, F: 16.049122807017543},
 					{T: 1587691100000, F: 15.922807017543859}, {T: 1587691200000, F: 15.63157894736842}, {T: 1587691300000, F: 14.982456140350875}, {T: 1587691400000, F: 14.187259188557553},
@@ -1195,7 +1200,7 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 			vec, err := r.Matrix()
 			testutil.Ok(t, err)
 			testutil.Equals(t, promql.Matrix{
-				{Metric: expectedLset, Floats: []promql.FPoint{
+				{DropName: true, Metric: expectedLset, Floats: []promql.FPoint{
 					{T: 1587691800000, F: 14.464425770308122},
 					{T: 1587692300000, F: 14.763025210084033},
 					{T: 1587692800000, F: 13.143575607888273},

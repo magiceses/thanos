@@ -4,29 +4,44 @@
 package store
 
 import (
+	"slices"
+
 	"github.com/prometheus/prometheus/model/labels"
-	"golang.org/x/exp/slices"
 
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"github.com/thanos-io/thanos/pkg/stringset"
+)
+
+type sortingStrategy uint64
+
+const (
+	sortingStrategyStore sortingStrategy = iota + 1
+	sortingStrategyNone
+	sortingStrategyStoreSendNoop
 )
 
 // flushableServer is an extension of storepb.Store_SeriesServer with a Flush method.
 type flushableServer interface {
 	storepb.Store_SeriesServer
+
 	Flush() error
 }
 
 func newFlushableServer(
 	upstream storepb.Store_SeriesServer,
-	labelNames stringset.Set,
-	replicaLabels []string,
+	sortingsortingStrategy sortingStrategy,
 ) flushableServer {
-	if labelNames.HasAny(replicaLabels) {
+	switch sortingsortingStrategy {
+	case sortingStrategyStore:
 		return &resortingServer{Store_SeriesServer: upstream}
+	case sortingStrategyNone:
+		return &passthroughServer{Store_SeriesServer: upstream}
+	case sortingStrategyStoreSendNoop:
+		return &resortingServer{Store_SeriesServer: upstream, notSend: true}
+	default:
+		// should not happen.
+		panic("unexpected sorting strategy")
 	}
-	return &passthroughServer{Store_SeriesServer: upstream}
 }
 
 // passthroughServer is a flushableServer that forwards all data to
@@ -42,11 +57,15 @@ func (p *passthroughServer) Flush() error { return nil }
 // Data is resorted and sent to an upstream server upon calling Flush.
 type resortingServer struct {
 	storepb.Store_SeriesServer
-	series []*storepb.Series
+	series  []*storepb.Series
+	notSend bool
 }
 
 func (r *resortingServer) Send(response *storepb.SeriesResponse) error {
 	if response.GetSeries() == nil {
+		if r.notSend {
+			return nil
+		}
 		return r.Store_SeriesServer.Send(response)
 	}
 
@@ -57,12 +76,15 @@ func (r *resortingServer) Send(response *storepb.SeriesResponse) error {
 }
 
 func (r *resortingServer) Flush() error {
-	slices.SortFunc(r.series, func(a, b *storepb.Series) bool {
+	slices.SortFunc(r.series, func(a, b *storepb.Series) int {
 		return labels.Compare(
 			labelpb.ZLabelsToPromLabels(a.Labels),
 			labelpb.ZLabelsToPromLabels(b.Labels),
-		) < 0
+		)
 	})
+	if r.notSend {
+		return nil
+	}
 	for _, response := range r.series {
 		if err := r.Store_SeriesServer.Send(storepb.NewSeriesResponse(response)); err != nil {
 			return err

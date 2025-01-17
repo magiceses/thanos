@@ -91,7 +91,11 @@ export const RulesContent: FC<RouteComponentProps & RulesContentProps> = ({ resp
                               <strong>for:</strong> {formatDuration(r.duration * 1000)}
                             </div>
                           )}
-
+                          {r.keepFiringFor > 0 && (
+                            <div>
+                              <strong>keep_firing_for:</strong> {formatDuration(r.keepFiringFor * 1000)}
+                            </div>
+                          )}
                           <div>
                             <strong>labels:</strong>
                             {Object.entries(r.labels).map(([key, value]) => (
@@ -113,6 +117,12 @@ export const RulesContent: FC<RouteComponentProps & RulesContentProps> = ({ resp
                         <td>
                           <GraphExpressionLink title="record" text={r.name} expr={r.name} />
                           <GraphExpressionLink title="expr" text={r.query} expr={r.query} />
+                          <strong>labels:</strong>
+                          {Object.entries(r.labels).map(([key, value]) => (
+                            <div className="ml-4" key={key}>
+                              {key}: {value}
+                            </div>
+                          ))}
                         </td>
                       )}
                       <td>

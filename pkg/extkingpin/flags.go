@@ -47,10 +47,8 @@ func Addrs(flags *kingpin.FlagClause) (target *addressSlice) {
 	return
 }
 
-// validateAddrs checks an address slice for duplicates and empty or invalid elements.
+// validateAddrs checks an address slice for empty or invalid elements.
 func validateAddrs(addrs addressSlice) error {
-	set := map[string]struct{}{}
-
 	for _, addr := range addrs {
 		if addr == "" {
 			return errors.New("Address is empty.")
@@ -61,12 +59,6 @@ func validateAddrs(addrs addressSlice) error {
 		if len(qtypeAndName) != 2 && len(hostAndPort) != 2 {
 			return errors.Errorf("Address %s is not of <host>:<port> format or a valid DNS query.", addr)
 		}
-
-		if _, ok := set[addr]; ok {
-			return errors.Errorf("Address %s is duplicated.", addr)
-		}
-
-		set[addr] = struct{}{}
 	}
 
 	return nil
@@ -119,7 +111,7 @@ func RegisterSelectorRelabelFlags(cmd FlagClause) *extflag.PathOrContent {
 	return extflag.RegisterPathOrContent(
 		cmd,
 		"selector.relabel-config",
-		"YAML file that contains relabeling configuration that allows selecting blocks. It follows native Prometheus relabel-config syntax. See format details: https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config ",
+		"YAML file with relabeling configuration that allows selecting blocks to act on based on their external labels. It follows thanos sharding relabel-config syntax. For format details see: https://thanos.io/tip/thanos/sharding.md/#relabelling ",
 		extflag.WithEnvSubstitution(),
 	)
 }

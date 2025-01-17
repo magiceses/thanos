@@ -21,6 +21,7 @@ import (
 	"github.com/thanos-io/objstore"
 
 	"github.com/efficientgo/core/testutil"
+
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
@@ -77,9 +78,9 @@ func (b *erroringBucket) IsObjNotFoundErr(err error) bool {
 	return b.bkt.IsObjNotFoundErr(err)
 }
 
-// IsCustomerManagedKeyError returns true if error means that customer managed key is invalid.
-func (b *erroringBucket) IsCustomerManagedKeyError(err error) bool {
-	return b.bkt.IsCustomerManagedKeyError(err)
+// IsAccessDeniedErr returns true if error means that access to the object was denied.
+func (b *erroringBucket) IsAccessDeniedErr(err error) bool {
+	return b.bkt.IsAccessDeniedErr(err)
 }
 
 // Attributes returns information about the specified object.
@@ -102,6 +103,16 @@ func (b *erroringBucket) Delete(ctx context.Context, name string) error {
 // Name returns the bucket name for the provider.
 func (b *erroringBucket) Name() string {
 	return b.bkt.Name()
+}
+
+// IterWithAttributes allows to iterate over objects in the bucket with their attributes.
+func (b *erroringBucket) IterWithAttributes(ctx context.Context, dir string, f func(objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	return b.bkt.IterWithAttributes(ctx, dir, f, options...)
+}
+
+// SupportedIterOptions returns the supported iteration options.
+func (b *erroringBucket) SupportedIterOptions() []objstore.IterOptionType {
+	return b.bkt.SupportedIterOptions()
 }
 
 // Ensures that downsampleBucket() stops its work properly
@@ -156,8 +167,9 @@ func TestRegression4960_Deadlock(t *testing.T) {
 	testutil.Ok(t, err)
 
 	metrics := newDownsampleMetrics(prometheus.NewRegistry())
-	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.GroupKey())))
-	metaFetcher, err := block.NewMetaFetcher(nil, block.FetcherConcurrency, bkt, "", nil, nil)
+	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.ResolutionString())))
+	baseBlockIDsFetcher := block.NewConcurrentLister(logger, bkt)
+	metaFetcher, err := block.NewMetaFetcher(nil, block.FetcherConcurrency, bkt, baseBlockIDsFetcher, "", nil, nil)
 	testutil.Ok(t, err)
 
 	metas, _, err := metaFetcher.Fetch(ctx)
@@ -195,14 +207,15 @@ func TestCleanupDownsampleCacheFolder(t *testing.T) {
 	testutil.Ok(t, err)
 
 	metrics := newDownsampleMetrics(prometheus.NewRegistry())
-	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.GroupKey())))
-	metaFetcher, err := block.NewMetaFetcher(nil, block.FetcherConcurrency, bkt, "", nil, nil)
+	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.ResolutionString())))
+	baseBlockIDsFetcher := block.NewConcurrentLister(logger, bkt)
+	metaFetcher, err := block.NewMetaFetcher(nil, block.FetcherConcurrency, bkt, baseBlockIDsFetcher, "", nil, nil)
 	testutil.Ok(t, err)
 
 	metas, _, err := metaFetcher.Fetch(ctx)
 	testutil.Ok(t, err)
 	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, metas, dir, 1, 1, metadata.NoneFunc, false))
-	testutil.Equals(t, 1.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.GroupKey())))
+	testutil.Equals(t, 1.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.ResolutionString())))
 
 	_, err = os.Stat(dir)
 	testutil.Assert(t, os.IsNotExist(err), "index cache dir should not exist at the end of execution")

@@ -19,18 +19,22 @@ import (
 	"github.com/thanos-io/objstore"
 
 	"github.com/efficientgo/core/testutil"
+
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 )
 
 func TestBestEffortCleanAbortedPartialUploads(t *testing.T) {
+	t.Parallel()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	bkt := objstore.WithNoopInstr(objstore.NewInMemBucket())
 	logger := log.NewNopLogger()
 
-	metaFetcher, err := block.NewMetaFetcher(nil, 32, bkt, "", nil, nil)
+	baseBlockIDsFetcher := block.NewConcurrentLister(logger, bkt)
+	metaFetcher, err := block.NewMetaFetcher(nil, 32, bkt, baseBlockIDsFetcher, "", nil, nil)
 	testutil.Ok(t, err)
 
 	// 1. No meta, old block, should be removed.

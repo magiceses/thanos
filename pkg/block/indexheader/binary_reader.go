@@ -23,6 +23,8 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/tsdb/encoding"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/index"
@@ -47,6 +49,8 @@ const (
 	postingLengthFieldSize = 4
 )
 
+var NotFoundRange = index.Range{Start: -1, End: -1}
+
 // The table gets initialized with sync.Once but may still cause a race
 // with any other use of the crc32 package anywhere. Thus we initialize it
 // before.
@@ -62,6 +66,32 @@ func newCRC32() hash.Hash32 {
 	return crc32.New(castagnoliTable)
 }
 
+// BinaryReaderMetrics holds metrics tracked by BinaryReader.
+type BinaryReaderMetrics struct {
+	downloadDuration prometheus.Histogram
+	loadDuration     prometheus.Histogram
+}
+
+// NewBinaryReaderMetrics makes new BinaryReaderMetrics.
+func NewBinaryReaderMetrics(reg prometheus.Registerer) *BinaryReaderMetrics {
+	return &BinaryReaderMetrics{
+		downloadDuration: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+			Name:                           "indexheader_download_duration_seconds",
+			Help:                           "Duration of the index-header download from objstore in seconds.",
+			Buckets:                        []float64{0.1, 0.2, 0.5, 1, 2, 5, 15, 30, 60, 90, 120, 300},
+			NativeHistogramMaxBucketNumber: 256,
+			NativeHistogramBucketFactor:    1.1,
+		}),
+		loadDuration: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+			Name:                           "indexheader_load_duration_seconds",
+			Help:                           "Duration of the index-header loading in seconds.",
+			Buckets:                        []float64{0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 15, 30, 60, 90, 120, 300},
+			NativeHistogramMaxBucketNumber: 256,
+			NativeHistogramBucketFactor:    1.1,
+		}),
+	}
+}
+
 // BinaryTOC is a table of content for index-header file.
 type BinaryTOC struct {
 	// Symbols holds start to the same symbols section as index related to this index header.
@@ -71,8 +101,18 @@ type BinaryTOC struct {
 }
 
 // WriteBinary build index header from the pieces of index in object storage, and cached in file if necessary.
-func WriteBinary(ctx context.Context, bkt objstore.BucketReader, id ulid.ULID, filename string) ([]byte, error) {
-	ir, indexVersion, err := newChunkedIndexReader(ctx, bkt, id)
+func WriteBinary(ctx context.Context, bkt objstore.BucketReader, id ulid.ULID, filename string, downloadDuration prometheus.Histogram) ([]byte, error) {
+	start := time.Now()
+
+	defer func() {
+		downloadDuration.Observe(time.Since(start).Seconds())
+	}()
+	var tmpDir = ""
+	if filename != "" {
+		tmpDir = filepath.Dir(filename)
+	}
+	parallelBucket := WrapWithParallel(bkt, tmpDir)
+	ir, indexVersion, err := newChunkedIndexReader(ctx, parallelBucket, id)
 	if err != nil {
 		return nil, errors.Wrap(err, "new index reader")
 	}
@@ -509,7 +549,7 @@ type BinaryReader struct {
 	nameSymbols map[uint32]string
 	// Direct cache of values. This is much faster than an LRU cache and still provides
 	// a reasonable cache hit ratio.
-	valueSymbolsMx sync.Mutex
+	valueSymbolsMx sync.RWMutex
 	valueSymbols   [valueSymbolsCacheSize]struct {
 		index  uint32
 		symbol string
@@ -522,13 +562,15 @@ type BinaryReader struct {
 	indexLastPostingEnd int64
 
 	postingOffsetsInMemSampling int
+
+	metrics *BinaryReaderMetrics
 }
 
 // NewBinaryReader loads or builds new index-header if not present on disk.
-func NewBinaryReader(ctx context.Context, logger log.Logger, bkt objstore.BucketReader, dir string, id ulid.ULID, postingOffsetsInMemSampling int) (*BinaryReader, error) {
+func NewBinaryReader(ctx context.Context, logger log.Logger, bkt objstore.BucketReader, dir string, id ulid.ULID, postingOffsetsInMemSampling int, metrics *BinaryReaderMetrics) (*BinaryReader, error) {
 	if dir != "" {
 		binfn := filepath.Join(dir, id.String(), block.IndexHeaderFilename)
-		br, err := newFileBinaryReader(binfn, postingOffsetsInMemSampling)
+		br, err := newFileBinaryReader(binfn, postingOffsetsInMemSampling, metrics)
 		if err == nil {
 			return br, nil
 		}
@@ -536,28 +578,29 @@ func NewBinaryReader(ctx context.Context, logger log.Logger, bkt objstore.Bucket
 		level.Debug(logger).Log("msg", "failed to read index-header from disk; recreating", "path", binfn, "err", err)
 
 		start := time.Now()
-		if _, err := WriteBinary(ctx, bkt, id, binfn); err != nil {
+		if _, err := WriteBinary(ctx, bkt, id, binfn, metrics.downloadDuration); err != nil {
 			return nil, errors.Wrap(err, "write index header")
 		}
 
 		level.Debug(logger).Log("msg", "built index-header file", "path", binfn, "elapsed", time.Since(start))
-		return newFileBinaryReader(binfn, postingOffsetsInMemSampling)
+		return newFileBinaryReader(binfn, postingOffsetsInMemSampling, metrics)
 	} else {
-		buf, err := WriteBinary(ctx, bkt, id, "")
+		buf, err := WriteBinary(ctx, bkt, id, "", metrics.downloadDuration)
 		if err != nil {
 			return nil, errors.Wrap(err, "generate index header")
 		}
 
-		return newMemoryBinaryReader(buf, postingOffsetsInMemSampling)
+		return newMemoryBinaryReader(buf, postingOffsetsInMemSampling, metrics)
 	}
 }
 
-func newMemoryBinaryReader(buf []byte, postingOffsetsInMemSampling int) (bw *BinaryReader, err error) {
+func newMemoryBinaryReader(buf []byte, postingOffsetsInMemSampling int, metrics *BinaryReaderMetrics) (bw *BinaryReader, err error) {
 	r := &BinaryReader{
 		b:                           realByteSlice(buf),
 		c:                           nil,
 		postings:                    map[string]*postingValueOffsets{},
 		postingOffsetsInMemSampling: postingOffsetsInMemSampling,
+		metrics:                     metrics,
 	}
 
 	if err := r.init(); err != nil {
@@ -567,7 +610,7 @@ func newMemoryBinaryReader(buf []byte, postingOffsetsInMemSampling int) (bw *Bin
 	return r, nil
 }
 
-func newFileBinaryReader(path string, postingOffsetsInMemSampling int) (bw *BinaryReader, err error) {
+func newFileBinaryReader(path string, postingOffsetsInMemSampling int, metrics *BinaryReaderMetrics) (bw *BinaryReader, err error) {
 	f, err := fileutil.OpenMmapFile(path)
 	if err != nil {
 		return nil, err
@@ -583,6 +626,7 @@ func newFileBinaryReader(path string, postingOffsetsInMemSampling int) (bw *Bina
 		c:                           f,
 		postings:                    map[string]*postingValueOffsets{},
 		postingOffsetsInMemSampling: postingOffsetsInMemSampling,
+		metrics:                     metrics,
 	}
 
 	if err := r.init(); err != nil {
@@ -617,6 +661,11 @@ func newBinaryTOCFromByteSlice(bs index.ByteSlice) (*BinaryTOC, error) {
 }
 
 func (r *BinaryReader) init() (err error) {
+	start := time.Now()
+
+	defer func() {
+		r.metrics.loadDuration.Observe(time.Since(start).Seconds())
+	}()
 	// Verify header.
 	if r.b.Len() < headerLen {
 		return errors.Wrap(encoding.ErrInvalidSize, "index header's header")
@@ -747,13 +796,18 @@ func (r *BinaryReader) IndexVersion() (int, error) {
 	return r.indexVersion, nil
 }
 
+// PostingsOffsets implements Reader.
+func (r *BinaryReader) PostingsOffsets(name string, values ...string) ([]index.Range, error) {
+	return r.postingsOffset(name, values...)
+}
+
 // TODO(bwplotka): Get advantage of multi value offset fetch.
 func (r *BinaryReader) PostingsOffset(name, value string) (index.Range, error) {
 	rngs, err := r.postingsOffset(name, value)
 	if err != nil {
 		return index.Range{}, err
 	}
-	if len(rngs) != 1 {
+	if len(rngs) != 1 || rngs[0] == NotFoundRange {
 		return index.Range{}, NotFoundRangeErr
 	}
 	return rngs[0], nil
@@ -801,6 +855,7 @@ func (r *BinaryReader) postingsOffset(name string, values ...string) ([]index.Ra
 	valueIndex := 0
 	for valueIndex < len(values) && values[valueIndex] < e.offsets[0].value {
 		// Discard values before the start.
+		rngs = append(rngs, NotFoundRange)
 		valueIndex++
 	}
 
@@ -811,6 +866,9 @@ func (r *BinaryReader) postingsOffset(name string, values ...string) ([]index.Ra
 		i := sort.Search(len(e.offsets), func(i int) bool { return e.offsets[i].value >= wantedValue })
 		if i == len(e.offsets) {
 			// We're past the end.
+			for len(rngs) < len(values) {
+				rngs = append(rngs, NotFoundRange)
+			}
 			break
 		}
 		if i > 0 && e.offsets[i].value != wantedValue {
@@ -825,6 +883,7 @@ func (r *BinaryReader) postingsOffset(name string, values ...string) ([]index.Ra
 
 		// Iterate on the offset table.
 		newSameRngs = newSameRngs[:0]
+	Iter:
 		for d.Err() == nil {
 			// Posting format entry is as follows:
 			// │ ┌────────────────────────────────────────┐ │
@@ -858,12 +917,23 @@ func (r *BinaryReader) postingsOffset(name string, values ...string) ([]index.Ra
 				// Record on the way if wanted value is equal to the current value.
 				if string(value) == wantedValue {
 					newSameRngs = append(newSameRngs, index.Range{Start: postingOffset + postingLengthFieldSize})
+				} else {
+					rngs = append(rngs, NotFoundRange)
 				}
 				valueIndex++
 				if valueIndex == len(values) {
 					break
 				}
 				wantedValue = values[valueIndex]
+				// Only do this if there is no new range added. If there is an existing
+				// range we want to continue iterating the offset table to get the end.
+				if len(newSameRngs) == 0 && i+1 < len(e.offsets) {
+					// We want to limit this loop within e.offsets[i, i+1). So when the wanted value
+					// is >= e.offsets[i+1], go out of the loop and binary search again.
+					if wantedValue >= e.offsets[i+1].value {
+						break Iter
+					}
+				}
 			}
 
 			if i+1 == len(e.offsets) {
@@ -877,6 +947,10 @@ func (r *BinaryReader) postingsOffset(name string, values ...string) ([]index.Ra
 			}
 
 			if valueIndex != len(values) && wantedValue <= e.offsets[i+1].value {
+				// Increment i when wanted value is same as next offset.
+				if wantedValue == e.offsets[i+1].value {
+					i++
+				}
 				// wantedValue is smaller or same as the next offset we know about, let's iterate further to add those.
 				continue
 			}
@@ -886,7 +960,7 @@ func (r *BinaryReader) postingsOffset(name string, values ...string) ([]index.Ra
 
 			if len(newSameRngs) > 0 {
 				// We added some ranges in this iteration. Use next posting offset as the end of our ranges.
-				// We know it exists as we never go further in this loop than e.offsets[i, i+1].
+				// We know it exists as we never go further in this loop than e.offsets[i, i+1).
 
 				skipNAndName(&d, &buf)
 				d.UvarintBytes() // Label value.
@@ -907,25 +981,25 @@ func (r *BinaryReader) postingsOffset(name string, values ...string) ([]index.Ra
 	return rngs, nil
 }
 
-func (r *BinaryReader) LookupSymbol(o uint32) (string, error) {
-	cacheIndex := o % valueSymbolsCacheSize
-	r.valueSymbolsMx.Lock()
-	if cached := r.valueSymbols[cacheIndex]; cached.index == o && cached.symbol != "" {
-		v := cached.symbol
-		r.valueSymbolsMx.Unlock()
-		return v, nil
-	}
-	r.valueSymbolsMx.Unlock()
-
-	if s, ok := r.nameSymbols[o]; ok {
-		return s, nil
-	}
-
+func (r *BinaryReader) LookupSymbol(ctx context.Context, o uint32) (string, error) {
 	if r.indexVersion == index.FormatV1 {
 		// For v1 little trick is needed. Refs are actual offset inside index, not index-header. This is different
 		// of the header length difference between two files.
 		o += headerLen - index.HeaderLen
 	}
+
+	if s, ok := r.nameSymbols[o]; ok {
+		return s, nil
+	}
+
+	cacheIndex := o % valueSymbolsCacheSize
+	r.valueSymbolsMx.RLock()
+	if cached := r.valueSymbols[cacheIndex]; cached.index == o && cached.symbol != "" {
+		v := cached.symbol
+		r.valueSymbolsMx.RUnlock()
+		return v, nil
+	}
+	r.valueSymbolsMx.RUnlock()
 
 	s, err := r.symbols.Lookup(o)
 	if err != nil {

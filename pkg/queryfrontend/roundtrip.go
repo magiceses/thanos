@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thanos-io/thanos/pkg/tenancy"
+
 	"github.com/thanos-io/thanos/pkg/querysharding"
 
 	"github.com/go-kit/log"
@@ -60,6 +62,7 @@ func NewTripperware(config Config, reg prometheus.Registerer, logger log.Logger)
 		queryRangeLimits,
 		queryRangeCodec,
 		config.NumShards,
+		config.CortexHandlerConfig.QueryStatsEnabled,
 		prometheus.WrapRegistererWith(prometheus.Labels{"tripperware": "query_range"}, reg), logger, config.ForwardHeaders)
 	if err != nil {
 		return nil, err
@@ -76,9 +79,17 @@ func NewTripperware(config Config, reg prometheus.Registerer, logger log.Logger)
 		queryInstantCodec,
 		prometheus.WrapRegistererWith(prometheus.Labels{"tripperware": "query_instant"}, reg),
 		config.ForwardHeaders,
+		config.CortexHandlerConfig.QueryStatsEnabled,
 	)
 	return func(next http.RoundTripper) http.RoundTripper {
-		return newRoundTripper(next, queryRangeTripperware(next), labelsTripperware(next), queryInstantTripperware(next), reg)
+		tripper := newRoundTripper(
+			next,
+			queryRangeTripperware(next),
+			labelsTripperware(next),
+			queryInstantTripperware(next),
+			reg,
+		)
+		return tenancy.InternalTenancyConversionTripper(config.TenantHeader, config.TenantCertField, tripper)
 	}, nil
 }
 
@@ -153,12 +164,18 @@ func newQueryRangeTripperware(
 	limits queryrange.Limits,
 	codec *queryRangeCodec,
 	numShards int,
+	forceStats bool,
 	reg prometheus.Registerer,
 	logger log.Logger,
 	forwardHeaders []string,
 ) (queryrange.Tripperware, error) {
 	queryRangeMiddleware := []queryrange.Middleware{queryrange.NewLimitsMiddleware(limits)}
 	m := queryrange.NewInstrumentMiddlewareMetrics(reg)
+
+	queryRangeMiddleware = append(
+		queryRangeMiddleware,
+		queryrange.NewStatsMiddleware(forceStats),
+	)
 
 	// step align middleware.
 	if config.AlignRangeWithStep {
@@ -199,7 +216,7 @@ func newQueryRangeTripperware(
 		queryCacheMiddleware, _, err := queryrange.NewResultsCacheMiddleware(
 			logger,
 			*config.ResultsCacheConfig,
-			newThanosCacheKeyGenerator(dynamicIntervalFn(config)),
+			newThanosCacheKeyGenerator(),
 			limits,
 			codec,
 			queryrange.PrometheusResponseExtractor{},
@@ -282,11 +299,10 @@ func newLabelsTripperware(
 	}
 
 	if config.ResultsCacheConfig != nil {
-		staticIntervalFn := func(_ queryrange.Request) time.Duration { return config.SplitQueriesByInterval }
 		queryCacheMiddleware, _, err := queryrange.NewResultsCacheMiddleware(
 			logger,
 			*config.ResultsCacheConfig,
-			newThanosCacheKeyGenerator(staticIntervalFn),
+			newThanosCacheKeyGenerator(),
 			limits,
 			codec,
 			ThanosResponseExtractor{},
@@ -326,8 +342,9 @@ func newInstantQueryTripperware(
 	codec queryrange.Codec,
 	reg prometheus.Registerer,
 	forwardHeaders []string,
+	forceStats bool,
 ) queryrange.Tripperware {
-	instantQueryMiddlewares := []queryrange.Middleware{}
+	var instantQueryMiddlewares []queryrange.Middleware
 	m := queryrange.NewInstrumentMiddlewareMetrics(reg)
 	if numShards > 0 {
 		analyzer := querysharding.NewQueryAnalyzer()
@@ -337,6 +354,11 @@ func newInstantQueryTripperware(
 			PromQLShardingMiddleware(analyzer, numShards, limits, codec, reg),
 		)
 	}
+
+	instantQueryMiddlewares = append(
+		instantQueryMiddlewares,
+		queryrange.NewStatsMiddleware(forceStats),
+	)
 
 	return func(next http.RoundTripper) http.RoundTripper {
 		rt := queryrange.NewRoundTripper(next, codec, forwardHeaders, instantQueryMiddlewares...)

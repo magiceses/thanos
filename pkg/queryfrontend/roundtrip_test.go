@@ -13,15 +13,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/weaveworks/common/user"
+	"go.uber.org/atomic"
 
-	"github.com/efficientgo/core/testutil"
 	cortexcache "github.com/thanos-io/thanos/internal/cortex/chunk/cache"
 	"github.com/thanos-io/thanos/internal/cortex/cortexpb"
+	"github.com/thanos-io/thanos/internal/cortex/frontend/transport"
 	"github.com/thanos-io/thanos/internal/cortex/querier/queryrange"
 	cortexvalidation "github.com/thanos-io/thanos/internal/cortex/util/validation"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
@@ -184,6 +186,7 @@ func TestRoundTripRetryMiddleware(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tpw, err := NewTripperware(
 				Config{
+					CortexHandlerConfig: &transport.HandlerConfig{},
 					QueryRangeConfig: QueryRangeConfig{
 						MaxRetries:             tc.maxRetries,
 						Limits:                 defaultLimits,
@@ -355,6 +358,7 @@ func TestRoundTripSplitIntervalMiddleware(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tpw, err := NewTripperware(
 				Config{
+					CortexHandlerConfig: &transport.HandlerConfig{},
 					QueryRangeConfig: QueryRangeConfig{
 						Limits:                 defaultLimits,
 						SplitQueriesByInterval: tc.splitInterval,
@@ -459,6 +463,7 @@ func TestRoundTripQueryRangeCacheMiddleware(t *testing.T) {
 
 	tpw, err := NewTripperware(
 		Config{
+			CortexHandlerConfig: &transport.HandlerConfig{},
 			QueryRangeConfig: QueryRangeConfig{
 				Limits:                 defaultLimits,
 				ResultsCacheConfig:     cacheConf,
@@ -556,6 +561,7 @@ func TestRoundTripQueryCacheWithShardingMiddleware(t *testing.T) {
 				ResultsCacheConfig:     cacheConf,
 				SplitQueriesByInterval: day,
 			},
+			CortexHandlerConfig: &transport.HandlerConfig{},
 		}, nil, log.NewNopLogger(),
 	)
 	testutil.Ok(t, err)
@@ -570,7 +576,7 @@ func TestRoundTripQueryCacheWithShardingMiddleware(t *testing.T) {
 		name     string
 		req      queryrange.Request
 		err      bool
-		expected int
+		expected int64
 	}{
 		{
 			name:     "query with vertical sharding",
@@ -609,7 +615,7 @@ func TestRoundTripQueryCacheWithShardingMiddleware(t *testing.T) {
 				testutil.Ok(t, err)
 			}
 
-			testutil.Equals(t, tc.expected, *res)
+			testutil.Equals(t, tc.expected, res.Load())
 		}) {
 			break
 		}
@@ -680,6 +686,7 @@ func TestRoundTripLabelsCacheMiddleware(t *testing.T) {
 				ResultsCacheConfig:     cacheConf,
 				SplitQueriesByInterval: day,
 			},
+			CortexHandlerConfig: &transport.HandlerConfig{},
 		}, nil, log.NewNopLogger(),
 	)
 	testutil.Ok(t, err)
@@ -788,6 +795,7 @@ func TestRoundTripSeriesCacheMiddleware(t *testing.T) {
 
 	tpw, err := NewTripperware(
 		Config{
+			CortexHandlerConfig: &transport.HandlerConfig{},
 			LabelsConfig: LabelsConfig{
 				Limits:                 defaultLimits,
 				ResultsCacheConfig:     cacheConf,
@@ -869,8 +877,8 @@ func promqlResults(fail bool) (*int, http.Handler) {
 
 // promqlResultsWithFailures is a mock handler used to test split and cache middleware.
 // it will return a failed response numFailures times.
-func promqlResultsWithFailures(numFailures int) (*int, http.Handler) {
-	count := 0
+func promqlResultsWithFailures(numFailures int) (*atomic.Int64, http.Handler) {
+	count := &atomic.Int64{}
 	var lock sync.Mutex
 	q := queryrange.PrometheusResponse{
 		Status: "success",
@@ -890,7 +898,7 @@ func promqlResultsWithFailures(numFailures int) (*int, http.Handler) {
 
 	cond := sync.NewCond(&sync.Mutex{})
 	cond.L.Lock()
-	return &count, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return count, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lock.Lock()
 		defer lock.Unlock()
 
@@ -914,7 +922,7 @@ func promqlResultsWithFailures(numFailures int) (*int, http.Handler) {
 		if numFailures == 0 {
 			cond.Broadcast()
 		}
-		count++
+		count.Add(1)
 	})
 }
 
